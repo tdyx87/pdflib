@@ -1,0 +1,57 @@
+{
+    "version": 3,
+    "cmakeMinimumRequired": {
+        "major": 3,
+        "minor": 15,
+        "patch": 0
+    },
+    "configurePresets": [
+        {
+            "name": "base",
+            "hidden": true,
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build/${presetName}"
+        },
+        {
+            "name": "all-backends",
+            "inherits": "base",
+            "displayName": "libharu + PoDoFo (via conan preset)",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "PDFLIB_WITH_LIBHARU": "ON",
+                "PDFLIB_WITH_PODOFO": "ON",
+                "PDFLIB_BUILD_TESTS": "ON",
+                "PDFLIB_BUILD_EXAMPLES": "ON",
+                "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/all-backends/build/Release/generators/conan_toolchain.cmake"
+            }
+        },
+        {
+            "name": "core-only",
+            "inherits": "base",
+            "displayName": "core + dummy backend only",
+            "cacheVariables": {
+                "PDFLIB_WITH_LIBHARU": "OFF",
+                "PDFLIB_WITH_PODOFO": "OFF",
+                "PDFLIB_BUILD_TESTS": "ON",
+                "PDFLIB_BUILD_EXAMPLES": "ON"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "all-backends",
+            "configurePreset": "all-backends"
+        },
+        {
+            "name": "core-only",
+            "configurePreset": "core-only"
+        }
+    ],
+    "testPresets": [
+        {
+            "name": "core-only",
+            "configurePreset": "core-only",
+            "output": { "outputOnFailure": true }
+        }
+    ]
+}

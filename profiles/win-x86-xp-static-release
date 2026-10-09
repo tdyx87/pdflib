@@ -1,0 +1,44 @@
+# Host + build profile: 32-bit (x86) with Windows XP support AND the
+# static CRT.
+#
+#   - arch=x86            32-bit, which is what XP-era print drivers use
+#   - compiler.toolset=v141_xp
+#                         the Visual Studio 2017 XP toolset. It is the
+#                         only toolset conan accepts here (settings.yml
+#                         allows [null, v110_xp, v120_xp, v140_xp,
+#                         v141_xp]) and it is what pulls in
+#                         _USING_V110_SDK71_, the Windows 7.1A SDK
+#                         include/lib paths and /SUBSYSTEM:5.01.
+#   - compiler.runtime=static
+#                         /MT, so no CRT DLL has to exist on the XP box
+#                         (the VC++ redistributable does not install on
+#                         XP for VS2015+ builds anyway).
+#
+# Prerequisites on the build machine, both required and both absent from
+# a stock VS2017 install:
+#   * the "Windows XP Support for C++" VS component (v141_xp), and
+#   * the Windows 7.1A SDK at
+#     C:\Program Files (x86)\Microsoft SDKs\Windows\v7.1A
+# Check with:
+#   dir "C:\Program Files (x86)\Microsoft Visual Studio\2017\Community\Common7\IDE\VC\VCTargets\Platforms\Win32\PlatformToolsets\v141_xp"
+#   dir "C:\Program Files (x86)\Microsoft SDKs\Windows\v7.1A\Lib\kernel32.lib"
+[settings]
+arch=x86
+build_type=Release
+compiler=msvc
+compiler.cppstd=14
+compiler.runtime=static
+compiler.toolset=v141_xp
+compiler.version=191
+os=Windows
+
+[conf]
+# The XP toolset is an MSBuild concept, so this profile must be used with
+# the Visual Studio generator, not Ninja.
+tools.cmake.cmaketoolchain:generator=Visual Studio 15 2017
+# Dependencies are built through conan helpers that do not all know how
+# to select the XP toolset (freetype uses meson, for example). Applying
+# the toolset's own marker define to every package keeps their CRT usage
+# on the XP-compatible code paths; the final link is what pins the import
+# names to the 7.1A SDK libraries.
+tools.build:defines=["_USING_V110_SDK71_"]

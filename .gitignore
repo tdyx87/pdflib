@@ -1,0 +1,34 @@
+# build dirs
+build/
+out/
+
+# downloaded reference sources used for offline syntax checks
+.reference/
+
+# local preview copies of built PDFs
+tools/pdf-preview/*.pdf
+
+# conan
+conan.lock
+conanbuild.sh
+conanbuild.bat
+conanrun.sh
+conanrun.bat
+graph_info.json
+
+# editors / os
+.vs/
+.vscode/
+*.user
+Thumbs.db
+
+# Freebuff workspace state
+.freebuff/
+
+# generated per-machine conan preset (points into build/)
+CMakeUserPresets.json
+
+# local build/test artifacts
+*.7z
+streamed-demo.pdf
+torn-job.pdf

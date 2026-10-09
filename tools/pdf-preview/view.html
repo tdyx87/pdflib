@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>pdflib PDF preview</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<style>
+  body { margin: 0; background: #525659; font-family: sans-serif; }
+  #bar { background: #323639; color: #eee; padding: 6px 12px; font-size: 13px; }
+  #bar button { margin-right: 8px; }
+  #wrap { display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 16px; }
+  canvas { box-shadow: 0 2px 8px rgba(0,0,0,.5); background: white; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <button id="prev">&#8592; prev</button>
+  <button id="next">next &#8594;</button>
+  <span id="info">loading&hellip;</span>
+</div>
+<div id="wrap"></div>
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+  "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+const params = new URLSearchParams(location.search);
+const file = params.get("file") || "hello-podofo.pdf";
+document.title = file + " - pdflib preview";
+let pdf = null, page = 1;
+async function render() {
+  const dpr = window.devicePixelRatio || 1;
+  const p = await pdf.getPage(page);
+  const vp = p.getViewport({ scale: 1.5 });
+  const c = document.createElement("canvas");
+  c.width = vp.width * dpr; c.height = vp.height * dpr;
+  c.style.width = vp.width + "px"; c.style.height = vp.height + "px";
+  await p.render({ canvasContext: c.getContext("2d"), viewport: vp, transform: dpr !== 1 ? [dpr,0,0,dpr,0,0] : null }).promise;
+  const wrap = document.getElementById("wrap");
+  wrap.innerHTML = ""; wrap.appendChild(c);
+  document.getElementById("info").textContent =
+    file + " - page " + page + " / " + pdf.numPages;
+}
+pdfjsLib.getDocument("http://127.0.0.1:8477/pdf-preview/" + file).promise
+  .then(p => { pdf = p; render(); })
+  .catch(e => { document.getElementById("info").textContent = "ERROR: " + e; });
+document.getElementById("prev").onclick = () => { if (page > 1) { page--; render(); } };
+document.getElementById("next").onclick = () => { if (pdf && page < pdf.numPages) { page++; render(); } };
+</script>
+</body>
+</html>

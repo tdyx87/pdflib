@@ -1,0 +1,4 @@
+sources:
+  "0.9.7":
+    url: "https://github.com/podofo/podofo/archive/refs/tags/0.9.7.tar.gz"
+    sha256: "42d7eaa3c8ffabf001121447830343c4362e562d0f12192b033a393f334a64a6"

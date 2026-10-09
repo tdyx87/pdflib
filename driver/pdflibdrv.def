@@ -1,0 +1,30 @@
+; pdflibdrv.def - the authoritative export list for pdflibdrv.dll.
+;
+; This file, not __declspec(dllexport), is what produces the import
+; surface. Using a .def keeps the exported names undecorated and stable
+; across x86/x64:
+;   * A __stdcall function exported with __declspec alone appears on x86
+;     as "_Name@N" (N = argument byte count) and on x64 as "Name".
+;   * Names listed here are exported verbatim on both architectures, so
+;     GetProcAddress("PdflibDrvJobCreate") works everywhere.
+; (Verified with dumpbin /exports; see docs/pdflibdrv-abi.md.)
+;
+; LIBRARY must match the actual DLL output name exactly, otherwise
+; link.exe emits LNK4070 and can emit the wrong file name.
+LIBRARY pdflibdrv
+
+EXPORTS
+    PdflibDrvStartup
+    PdflibDrvShutdown
+    PdflibDrvGetAbiVersion
+    PdflibDrvVersionString
+    PdflibDrvStatusString
+    PdflibDrvJobCreate
+    PdflibDrvJobFinish
+    PdflibDrvJobAbort
+    PdflibDrvJobLastError
+    PdflibDrvPageAdd
+    PdflibDrvPageSetRotation
+    PdflibDrvPageDrawText
+    PdflibDrvPageDrawRect
+    PdflibDrvPageDrawLine
