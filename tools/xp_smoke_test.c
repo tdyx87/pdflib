@@ -79,6 +79,25 @@ static void check(int ok, const char *what)
     printf("  [%s] %s\n", ok ? "PASS" : "FAIL", what);
 }
 
+/* GetVersionExA is deprecated in favour of the version helpers, but those
+   answer according to the binary's manifest while this program wants the
+   raw reported version - on XP, the only machine where the answer matters
+   here, the two agree anyway. The warning is disabled around this one
+   call so that a deprecation notice cannot hide a real one. */
+static int query_os_version(OSVERSIONINFOA *osv)
+{
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable: 4996)
+#endif
+    memset(osv, 0, sizeof(*osv));
+    osv->dwOSVersionInfoSize = sizeof(*osv);
+    return GetVersionExA(osv) ? 1 : 0;
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+}
+
 static void check_status(pd_status got, pd_status want, const char *what)
 {
     g_checks++;
@@ -206,11 +225,22 @@ static void check_image_and_exports(HMODULE mod, int *out_export_summary_ok)
            nt->OptionalHeader.Subsystem == IMAGE_SUBSYSTEM_WINDOWS_GUI ? "GUI" :
            nt->OptionalHeader.Subsystem == IMAGE_SUBSYSTEM_WINDOWS_CUI ? "console" : "other");
 
+#if defined(_M_IX86)
+    /* 32-bit build of the test: it exists to validate the XP target, so
+       the PE targeting is a hard requirement, not a remark. */
     check(nt->FileHeader.Machine == IMAGE_FILE_MACHINE_I386,
           "the DLL is a 32-bit x86 image (what XP needs)");
     check(nt->OptionalHeader.MajorSubsystemVersion == 5 &&
           nt->OptionalHeader.MinorSubsystemVersion == 1,
           "subsystem version is 5.01, i.e. built to run on XP");
+#else
+    /* The x64 configurations build this same program against the x64 DLL
+       to keep the ABI checks covered there, and on a 64-bit image neither
+       statement is true or wanted - say so instead of failing. */
+    printf("  (64-bit build of this program: XP targeting is not asserted)\n");
+    check(nt->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64,
+          "the DLL matches this 64-bit test program");
+#endif
 
     exp = (IMAGE_EXPORT_DIRECTORY *)(base +
             nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
@@ -355,9 +385,7 @@ int main(int argc, char **argv)
     printf("=======================\n\n");
 
     /* --- where am I running? --------------------------------------- */
-    memset(&osv, 0, sizeof(osv));
-    osv.dwOSVersionInfoSize = sizeof(osv);
-    GetVersionExA(&osv);
+    query_os_version(&osv);
     printf("OS            : %lu.%lu (build %lu) %s\n",
            (unsigned long)osv.dwMajorVersion,
            (unsigned long)osv.dwMinorVersion,
@@ -562,7 +590,7 @@ int main(int argc, char **argv)
                  "JobAbort(forged handle) returns PD_ERR_INVALID_HANDLE");
     /* reaching this line at all is the evidence: a dereferenced fake
        handle would have taken the process down before it printed. */
-    check(GetVersionExA(&osv) != 0,
+    check(query_os_version(&osv) != 0,
           "the process survived the forged handles (no access violation)");
 
     /* --- 10. shutdown releases unfinished jobs --------------------- */
