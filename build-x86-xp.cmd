@@ -60,4 +60,11 @@ set "DUMPBIN=%VCToolsInstallDir%bin\HostX86\x86\dumpbin.exe"
 if not exist "%DUMPBIN%" set "DUMPBIN=dumpbin"
 "%PYTHON%" tools\check_xp_imports.py "%DUMPBIN%" build\xp-cmake\Release\pdflibdrv.dll
 if errorlevel 1 exit /b 1
+rem The XP smoke test ships inside the VM as well, so it gets the same
+rem audit: a test program that cannot load on XP proves nothing.
+"%PYTHON%" tools\check_xp_imports.py "%DUMPBIN%" build\xp-cmake\Release\pdflibdrv_xp_smoke.exe
+if errorlevel 1 exit /b 1
 echo [OK] x86 + Windows XP build verified
+rem To check it on a real XP machine, copy pdflibdrv.dll and
+rem pdflibdrv_xp_smoke.exe into a folder there and run the exe
+rem (see docs\xp-validation.md).

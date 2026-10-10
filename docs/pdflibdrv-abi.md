@@ -24,6 +24,8 @@ tested before they get anywhere near a printer.
 | [build-mt.cmd](../build-mt.cmd) | static-CRT x64 build (`profiles/win-x64-static-release`) |
 | [build-x86-xp.cmd](../build-x86-xp.cmd) | 32-bit Windows XP build (`profiles/win-x86-xp-static-release`) |
 | [tools/check_xp_imports.py](../tools/check_xp_imports.py) | import-table audit for XP (no missing DLL, no post-XP API) |
+| [tools/xp_smoke_test.c](../tools/xp_smoke_test.c) | self-checking ABI consumer to run *on* an XP machine |
+| [docs/xp-validation.md](xp-validation.md) | how to run that program in an XP VM, and how to read it |
 | [.github/workflows/ci.yml](../.github/workflows/ci.yml) | GitHub Actions: the three configurations below, on a Windows runner |
 | [ci/build-windows.ps1](../ci/build-windows.ps1) | the shared build+test entry point that workflow runs (also runnable locally) |
 | [ci/ensure-vs-components.ps1](../ci/ensure-vs-components.ps1) | installs the v141 / v141_xp VS components on a hosted runner (a no-op elsewhere) |

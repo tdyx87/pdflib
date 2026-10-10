@@ -269,6 +269,57 @@ function Enter-MsvcEnvironment {
     Write-Host ("    -> cl from '" + $env:VCToolsInstallDir + "': " + $cl.Source) -ForegroundColor DarkGray
 }
 
+function Resolve-CMake {
+    <# The project needs CMake >= 3.15, but vcvarsall puts the IDE's own
+       CMake at the very front of PATH and VS2017 ships 3.12 - so on a
+       machine whose IDE predates the floor, `cmake` resolves to a version
+       that cannot even read CMakeLists.txt, while a current CMake sits
+       unused in Program Files. Collect the candidates, then take the
+       newest one that clears the floor. #>
+    $need = [version]'3.15'
+    $candidates = @()
+    $onPath = Get-Command cmake -ErrorAction SilentlyContinue
+    if ($onPath) { $candidates += $onPath.Source }
+    foreach ($root in @(${env:ProgramFiles}, ${env:ProgramFiles(x86)})) {
+        $candidates += (Join-Path $root 'CMake\bin\cmake.exe')
+        $base = Join-Path $root 'Microsoft Visual Studio'
+        if (-not (Test-Path $base)) { continue }
+        $candidates += @(Get-ChildItem $base -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object { Get-ChildItem $_.FullName -Directory -ErrorAction SilentlyContinue } |
+            ForEach-Object {
+                Join-Path $_.FullName 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
+            })
+    }
+
+    $best = $null
+    $seen = @()
+    foreach ($candidate in ($candidates | Select-Object -Unique)) {
+        if (-not (Test-Path $candidate)) { continue }
+        # [string] and the [0] matter: -match only populates $matches for a
+        # scalar left operand, and under Set-StrictMode reading an unset
+        # $matches throws (this cost a round during development).
+        $line = @(& $candidate --version 2>$null | Select-Object -First 1)[0]
+        if (-not $line -or ([string]$line -notmatch 'cmake version (\d+\.\d+\.\d+)')) {
+            Write-Host ("    ignoring unusable cmake: " + $candidate) -ForegroundColor DarkGray
+            continue
+        }
+        $version = [version]$matches[1]
+        $seen += ("{0} ({1})" -f $candidate, $version)
+        if ($version -ge $need -and (-not $best -or $version -gt $best.Version)) {
+            $best = @{ Path = $candidate; Version = $version }
+        }
+    }
+    if (-not $best) {
+        throw ("no cmake >= $need found (candidates: " + ($seen -join '; ') + ')')
+    }
+    # ctest must come from the same installation: `--test-dir` only exists
+    # from CMake 3.20, and a bare `ctest` inherits the same shadowing here.
+    $ctest = Join-Path (Split-Path -Parent $best.Path) 'ctest.exe'
+    if (-not (Test-Path $ctest)) { $ctest = 'ctest' }
+    $best.CTest = $ctest
+    return $best
+}
+
 function Resolve-Dumpbin {
     if ($env:VCToolsInstallDir) {
         $candidate = Join-Path $env:VCToolsInstallDir 'bin\HostX86\x86\dumpbin.exe'
@@ -290,6 +341,7 @@ $RepoRoot = (Resolve-Path $RepoRoot).Path
 Set-Location $RepoRoot
 
 $vs = Resolve-VisualStudio
+$cmake = Resolve-CMake
 $conan = Resolve-Conan
 # @() matters: a function that returns a one-element list hands PowerShell a
 # bare string, and "$string + $array" would concatenate instead of appending.
@@ -328,6 +380,7 @@ Write-Host ("repository    : {0}" -f $RepoRoot)
 Write-Host ("Visual Studio : {0} ({1})" -f $vs.Path, $vs.Version)
 Write-Host ("generator     : {0}" -f $vs.Generator)
 Write-Host ("MSVC arch     : {0} {1}" -f $arch, $(if ($vcvarsVer) { "-vcvars_ver=$vcvarsVer" } else { '(IDE default v141)' }))
+Write-Host ("cmake         : {0} ({1})" -f $cmake.Path, $cmake.Version)
 Write-Host ("conan         : {0}" -f (Format-Command $conan.Conan))
 
 # Both the /MT profile and the XP profile are host profiles compiled with a
@@ -357,11 +410,11 @@ switch ($Variant) {
                 'build/all-backends/build/Release/generators/CMakePresets.json'))
 
         Invoke-Checked 'configure (all-backends preset + driver)' @(
-            'cmake', '--preset', 'all-backends', '-DPDFLIB_BUILD_DRIVER=ON')
-        Invoke-Checked 'build' @('cmake', '--build', '--preset', 'all-backends')
-        Invoke-Checked 'tests' @('ctest', '--test-dir', 'build/all-backends', '--output-on-failure')
+            $cmake.Path, '--preset', 'all-backends', '-DPDFLIB_BUILD_DRIVER=ON')
+        Invoke-Checked 'build' @($cmake.Path, '--build', '--preset', 'all-backends')
+        Invoke-Checked 'tests' @($cmake.CTest, '--test-dir', 'build/all-backends', '--output-on-failure')
         Invoke-Checked 'driver contract tests' @(
-            'ctest', '--test-dir', 'build/all-backends', '-R', 'pdflibdrv_harness', '--output-on-failure')
+            $cmake.CTest, '--test-dir', 'build/all-backends', '-R', 'pdflibdrv_harness', '--output-on-failure')
     }
 
     'mt' {
@@ -383,15 +436,15 @@ switch ($Variant) {
                 'build/all-backends/build/Release/generators/CMakePresets.json'))
 
         Invoke-Checked 'configure (Ninja, static CRT required)' @(
-            'cmake', '-S', '.', '-B', 'build/mt-cmake', '-G', 'Ninja',
+            $cmake.Path, '-S', '.', '-B', 'build/mt-cmake', '-G', 'Ninja',
             '-DCMAKE_BUILD_TYPE=Release',
             '-DCMAKE_TOOLCHAIN_FILE=build/mt/build/Release/generators/conan_toolchain.cmake',
             '-DPDFLIB_WITH_LIBHARU=OFF', '-DPDFLIB_WITH_PODOFO=ON',
             '-DPDFLIB_BUILD_TESTS=ON', '-DPDFLIB_BUILD_EXAMPLES=ON',
             '-DPDFLIB_BUILD_DRIVER=ON', '-DPDFLIB_DRIVER_STATIC_CRT=ON')
-        Invoke-Checked 'build' @('cmake', '--build', 'build/mt-cmake')
+        Invoke-Checked 'build' @($cmake.Path, '--build', 'build/mt-cmake')
         Invoke-Checked 'tests (incl. export table + no-dynamic-CRT guard)' @(
-            'ctest', '--test-dir', 'build/mt-cmake', '--output-on-failure')
+            $cmake.CTest, '--test-dir', 'build/mt-cmake', '--output-on-failure')
     }
 
     'x86xp' {
@@ -411,18 +464,24 @@ switch ($Variant) {
                 'build/all-backends/build/Release/generators/CMakePresets.json'))
 
         Invoke-Checked 'configure (Win32 + v141_xp, static CRT required)' @(
-            'cmake', '-S', '.', '-B', 'build/xp-cmake', '-G', $vs.Generator,
+            $cmake.Path, '-S', '.', '-B', 'build/xp-cmake', '-G', $vs.Generator,
             '-A', 'Win32', '-T', 'v141_xp',
             '-DCMAKE_TOOLCHAIN_FILE=build/xp/build/generators/conan_toolchain.cmake',
             '-DPDFLIB_WITH_LIBHARU=OFF', '-DPDFLIB_WITH_PODOFO=ON',
             '-DPDFLIB_BUILD_TESTS=ON', '-DPDFLIB_BUILD_EXAMPLES=OFF',
             '-DPDFLIB_BUILD_DRIVER=ON', '-DPDFLIB_DRIVER_STATIC_CRT=ON')
-        Invoke-Checked 'build' @('cmake', '--build', 'build/xp-cmake', '--config', 'Release')
-        Invoke-Checked 'tests' @('ctest', '--test-dir', 'build/xp-cmake', '-C', 'Release', '--output-on-failure')
+        Invoke-Checked 'build' @($cmake.Path, '--build', 'build/xp-cmake', '--config', 'Release')
+        Invoke-Checked 'tests' @($cmake.CTest, '--test-dir', 'build/xp-cmake', '-C', 'Release', '--output-on-failure')
 
         $dumpbin = if ($DryRun) { 'dumpbin' } else { Resolve-Dumpbin }
-        Invoke-Checked 'XP import audit' (Python-Command @(
+        Invoke-Checked 'XP import audit (pdflibdrv.dll)' (Python-Command @(
                 'tools/check_xp_imports.py', $dumpbin, 'build/xp-cmake/Release/pdflibdrv.dll'))
+        # The test program ships inside the VM too, so it gets the same
+        # audit: an xp_smoke_test.exe that cannot load on XP would make the
+        # whole exercise meaningless.
+        Invoke-Checked 'XP import audit (xp smoke test)' (Python-Command @(
+                'tools/check_xp_imports.py', $dumpbin,
+                'build/xp-cmake/Release/pdflibdrv_xp_smoke.exe'))
     }
 }
 

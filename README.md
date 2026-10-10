@@ -398,6 +398,8 @@ build-mt.cmd            driver facade build (/MT, static-runtime backends)
 build-x86-xp.cmd        driver facade build (x86 + Windows XP, v141_xp)
 profiles/                conan profiles (x64 static, x86 + XP static)
 tools/check_xp_imports.py  import-table audit for Windows XP
+tools/xp_smoke_test.c   self-checking ABI consumer for a real XP machine
+docs/xp-validation.md   how to run that check inside an XP VM
 ```
 
 ## Memory characteristics of streamed mode

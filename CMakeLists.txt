@@ -236,6 +236,24 @@ if(PDFLIB_BUILD_DRIVER)
             add_test(NAME pdflibdrv_c_link_check
                      COMMAND pdflibdrv_c_link_check)
         endif()
+
+        # The XP half of the verification: a self-checking consumer meant
+        # to be copied, together with pdflibdrv.dll, into a real Windows
+        # XP machine. It is built by whatever toolset builds the DLL, so
+        # in the x86-xp configuration it is itself a v141_xp /MT /5.01
+        # binary - a pass there is about the DLL, not about the test.
+        # It takes an optional DLL path or directory (default: next to
+        # the executable), hence the ctest argument ordering.
+        add_executable(pdflibdrv_xp_smoke tools/xp_smoke_test.c)
+        target_include_directories(pdflibdrv_xp_smoke PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/driver)
+        if(MSVC)
+            target_compile_options(pdflibdrv_xp_smoke PRIVATE /W4)
+        endif()
+        if(PDFLIB_BUILD_TESTS)
+            add_test(NAME pdflibdrv_xp_smoke
+                     COMMAND pdflibdrv_xp_smoke $<TARGET_FILE_DIR:pdflibdrv>)
+        endif()
     endif()
 endif()
 
