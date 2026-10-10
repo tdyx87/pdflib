@@ -109,11 +109,11 @@ function Show-InstallerLogs {
     Write-Host ''
     Write-Host ("--- " + $log.Name + ": error-looking lines") -ForegroundColor Yellow
     Select-String -Path $log.FullName -ErrorAction SilentlyContinue `
-        -Pattern 'rror|exit code|Unrecognized|unrecognized|not recognized|Invalid|invalid parameter|Failure|failed' |
-        Select-Object -First 30 |
+        -Pattern 'rror|exit code|Unrecognized|unrecognized|not recognized|Invalid|invalid parameter|Failure|failed|Cannot|cannot|Unable|unable' |
+        Select-Object -First 40 |
         ForEach-Object { Write-Host ("    " + $_.Line.Trim()) }
-    Write-Host ("--- " + $log.Name + ": last 12 lines") -ForegroundColor Yellow
-    Get-Content -Path $log.FullName -Tail 12 -ErrorAction SilentlyContinue |
+    Write-Host ("--- " + $log.Name + ": last 60 lines") -ForegroundColor Yellow
+    Get-Content -Path $log.FullName -Tail 60 -ErrorAction SilentlyContinue |
         ForEach-Object { Write-Host ("    " + $_) }
 }
 
@@ -152,7 +152,17 @@ if (-not (Test-Path $installer)) { throw "vs_installer.exe not found at '$instal
 # accepts - passing it fails the whole modify with exit code 87 (invalid
 # parameter) and the component never lands. Waiting is done by polling for
 # the component below, which is what actually tells us the install finished.
-$installerArgs = @('modify', '--installPath', $vsPath, '--quiet', '--norestart', '--nocache')
+#
+# Pin the channel to the product that is actually installed. Without this the
+# image's installer had already moved its attention to the *next* release
+# (the log showed it fetching VisualStudio.18.Release.chman while the image
+# carries VisualStudio 17.14) and the modify ended in exit code 1 without
+# saying much.
+$channelMajor = if ([string]$vsVersion -match '^(\d+)') { $matches[1] } else { '17' }
+$channelUri = "https://aka.ms/vs/$channelMajor/release/channel"
+$installerArgs = @('modify', '--installPath', $vsPath,
+    '--channelUri', $channelUri, '--installChannelUri', $channelUri,
+    '--quiet', '--norestart', '--nocache', '--installWhileDownloading')
 foreach ($c in $missing) { $installerArgs += @('--add', $c) }
 
 Write-Host ''
