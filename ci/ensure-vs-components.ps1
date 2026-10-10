@@ -36,7 +36,10 @@ param(
     [string]$Needs,
 
     [switch]$DryRun,
-    [switch]$ForceMissing
+    [switch]$ForceMissing,
+
+    # How long to wait for the installer to actually land the component.
+    [int]$TimeoutMinutes = 25
 )
 
 $ErrorActionPreference = 'Stop'
@@ -78,6 +81,27 @@ function Test-Win71Sdk {
     return Test-Path (Join-Path ${env:ProgramFiles(x86)} 'Microsoft SDKs\Windows\v7.1A\Lib\kernel32.lib')
 }
 
+function Test-Needed {
+    if (-not (Test-V141Tools)) { return $false }
+    if ($Needs -eq 'xp') {
+        if (-not (Test-XpToolset)) { return $false }
+        if (-not (Test-Win71Sdk)) { return $false }
+    }
+    return $true
+}
+
+function Show-InstallerLogs {
+    <# the installer keeps its real diagnosis in %TEMP%\dd_*.log #>
+    $logs = @(Get-ChildItem -Path $env:TEMP -Filter 'dd_*.log' -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 2)
+    foreach ($l in $logs) {
+        Write-Host ''
+        Write-Host ("--- tail of " + $l.Name) -ForegroundColor Yellow
+        Get-Content -Path $l.FullName -Tail 40 -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host ("    " + $_) }
+    }
+}
+
 $haveV141 = (Test-V141Tools) -and -not $ForceMissing
 $haveXp = (Test-XpToolset) -and -not $ForceMissing
 $haveSdk = (Test-Win71Sdk) -and -not $ForceMissing
@@ -115,22 +139,59 @@ foreach ($c in $missing) { $installerArgs += @('--add', $c) }
 Write-Host ''
 Write-Host ('==> Visual Studio Installer: ' + ($missing -join ', ')) -ForegroundColor Cyan
 Write-Host ('    vs_installer.exe ' + ($installerArgs -join ' ')) -ForegroundColor DarkGray
+Write-Host ('    waiting up to {0} minute(s) for the component to appear' -f $TimeoutMinutes) -ForegroundColor DarkGray
 if ($DryRun) {
     Write-Host '[dry-run] nothing invoked'
     exit 0
 }
 
-& $installer @installerArgs
-# 0 = done, 3010 = done but a reboot is pending (GitHub runners never reboot,
-# and the MSBuild toolset is usable immediately).
-if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 3010) {
-    throw "vs_installer failed with exit code $LASTEXITCODE"
+# vs_installer.exe only *starts* the install - it hands the work to
+# vs_installershell.exe and exits within a second. Polling for the component
+# is therefore the only reliable "is it done": an immediate re-check after
+# the launcher returns reports failure while the install is still running
+# (this cost one red CI run).
+$started = Get-Date
+$proc = Start-Process -FilePath $installer -ArgumentList $installerArgs -PassThru
+$deadline = $started.AddMinutes($TimeoutMinutes)
+$installed = $false
+$idleTicks = 0
+while ($true) {
+    if (Test-Needed) { $installed = $true; break }
+    $now = Get-Date
+    if ($now -ge $deadline) { break }
+    $busy = @(Get-Process -Name 'vs_installer', 'vs_installershell' -ErrorAction SilentlyContinue).Count
+    # "Nothing is installing and the component still is not there" only means
+    # failure once the shell has had time to show up.
+    if ($busy -eq 0 -and $now -gt $started.AddSeconds(90)) {
+        $idleTicks++
+        if ($idleTicks -ge 6) { break }
+    }
+    else {
+        $idleTicks = 0
+    }
+    Write-Host ('    ... waiting for the installer ({0} active process(es), {1:hh\:mm\:ss} left)' -f `
+            $busy, ($deadline - $now))
+    Start-Sleep -Seconds 10
 }
 
-# Re-check: a silent partial install would otherwise surface much later as
-# an obscure MSBuild error.
-if (-not (Test-V141Tools)) { throw 'v141 compiler still missing after install' }
-if ($Needs -eq 'xp' -and -not (Test-XpToolset)) { throw 'v141_xp toolset still missing after install' }
-if ($Needs -eq 'xp' -and -not (Test-Win71Sdk)) { throw 'Windows 7.1A SDK still missing after install' }
+$proc.Refresh()
+$exit = if ($proc.HasExited) { $proc.ExitCode } else { $null }
+Write-Host ('    vs_installer.exe exit: {0}' -f `
+        $(if ($null -eq $exit) { 'still running' } else { $exit }))
+# 0 = done, 3010 = done but a reboot is pending (runners never reboot, and the
+# MSBuild toolset is usable immediately).
+if ($null -ne $exit -and $exit -ne 0 -and $exit -ne 3010) {
+    Show-InstallerLogs
+    throw "vs_installer failed with exit code $exit"
+}
+
+# Re-check: a silent partial install would otherwise surface much later as an
+# obscure MSBuild error.
+if (-not $installed) {
+    Show-InstallerLogs
+    if (-not (Test-V141Tools)) { throw 'v141 compiler still missing after install' }
+    if ($Needs -eq 'xp' -and -not (Test-XpToolset)) { throw 'v141_xp toolset still missing after install' }
+    if ($Needs -eq 'xp' -and -not (Test-Win71Sdk)) { throw 'Windows 7.1A SDK still missing after install' }
+}
 
 Write-Host '[OK] Visual Studio components installed'

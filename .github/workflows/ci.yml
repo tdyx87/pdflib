@@ -58,7 +58,7 @@ jobs:
   x64-mt:
     name: x64 /MT - static CRT
     runs-on: ${{ vars.WINDOWS_RUNNER || 'windows-2022' }}
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -68,7 +68,7 @@ jobs:
         run: python -m pip install "conan==${{ env.CONAN_VERSION }}" meson ninja
       - name: Ensure the v141 compiler is installed
         shell: pwsh
-        run: ./ci/ensure-vs-components.ps1 -Needs v141
+        run: ./ci/ensure-vs-components.ps1 -Needs v141 -TimeoutMinutes 30
       - name: Build and test
         shell: pwsh
         run: ./ci/build-windows.ps1 -Variant mt
@@ -82,7 +82,7 @@ jobs:
   x86-xp:
     name: x86 + Windows XP - v141_xp static CRT
     runs-on: ${{ vars.WINDOWS_RUNNER || 'windows-2022' }}
-    timeout-minutes: 120
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -92,7 +92,7 @@ jobs:
         run: python -m pip install "conan==${{ env.CONAN_VERSION }}" meson ninja
       - name: Ensure the v141_xp toolset is installed
         shell: pwsh
-        run: ./ci/ensure-vs-components.ps1 -Needs xp
+        run: ./ci/ensure-vs-components.ps1 -Needs xp -TimeoutMinutes 40
       - name: Build, test and audit for XP
         shell: pwsh
         run: ./ci/build-windows.ps1 -Variant x86xp
