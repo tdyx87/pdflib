@@ -179,8 +179,26 @@ if ($DryRun) {
 # is therefore the only reliable "is it done": an immediate re-check after
 # the launcher returns reports failure while the install is still running
 # (this cost one red CI run).
+# `&` and not Start-Process: -ArgumentList joins its elements with spaces
+# and does NOT quote them, so "--installPath C:\Program Files\...\Enterprise"
+# arrived as `installPath: C:\Program` and the installer answered "an
+# installed product matching the following parameters cannot be found"
+# (exit 1). Verified locally: the same call through -ArgumentList also broke
+# a Python -c script argument. The call operator passes each element as one
+# properly quoted argument.
 $started = Get-Date
-$proc = Start-Process -FilePath $installer -ArgumentList $installerArgs -PassThru
+& $installer @installerArgs
+$exit = $LASTEXITCODE
+Write-Host ('    vs_installer.exe exit: {0}' -f $exit)
+# 0 = done, 3010 = done but a reboot is pending (runners never reboot, and the
+# MSBuild toolset is usable immediately).
+if ($exit -ne 0 -and $exit -ne 3010) {
+    Show-InstallerLogs
+    throw "vs_installer failed with exit code $exit"
+}
+
+# The launcher returns as soon as it hands the work over, so the component
+# itself is what to wait for.
 $deadline = $started.AddMinutes($TimeoutMinutes)
 $installed = $false
 $idleTicks = 0
@@ -201,17 +219,6 @@ while ($true) {
     Write-Host ('    ... waiting for the installer ({0} active process(es), {1:hh\:mm\:ss} left)' -f `
             $busy, ($deadline - $now))
     Start-Sleep -Seconds 10
-}
-
-$proc.Refresh()
-$exit = if ($proc.HasExited) { $proc.ExitCode } else { $null }
-Write-Host ('    vs_installer.exe exit: {0}' -f `
-        $(if ($null -eq $exit) { 'still running' } else { $exit }))
-# 0 = done, 3010 = done but a reboot is pending (runners never reboot, and the
-# MSBuild toolset is usable immediately).
-if ($null -ne $exit -and $exit -ne 0 -and $exit -ne 3010) {
-    Show-InstallerLogs
-    throw "vs_installer failed with exit code $exit"
 }
 
 # Re-check: a silent partial install would otherwise surface much later as an
