@@ -153,15 +153,12 @@ if (-not (Test-Path $installer)) { throw "vs_installer.exe not found at '$instal
 # parameter) and the component never lands. Waiting is done by polling for
 # the component below, which is what actually tells us the install finished.
 #
-# Pin the channel to the product that is actually installed. Without this the
-# image's installer had already moved its attention to the *next* release
-# (the log showed it fetching VisualStudio.18.Release.chman while the image
-# carries VisualStudio 17.14) and the modify ended in exit code 1 without
-# saying much.
-$channelMajor = if ([string]$vsVersion -match '^(\d+)') { $matches[1] } else { '17' }
-$channelUri = "https://aka.ms/vs/$channelMajor/release/channel"
+# Deliberately no --channelUri/--installChannelUri: pointing the installer at
+# a channel other than the one the image's product was installed from made it
+# re-register the product, after which vswhere (and vcvarsall with it) could
+# not see the installation at all for minutes. The reason the modify had
+# failed before was a quoting bug, not the channel.
 $installerArgs = @('modify', '--installPath', $vsPath,
-    '--channelUri', $channelUri, '--installChannelUri', $channelUri,
     '--quiet', '--norestart', '--nocache', '--installWhileDownloading')
 foreach ($c in $missing) { $installerArgs += @('--add', $c) }
 
@@ -228,6 +225,26 @@ if (-not $installed) {
     if (-not (Test-V141Tools)) { throw 'v141 compiler still missing after install' }
     if ($Needs -eq 'xp' -and -not (Test-XpToolset)) { throw 'v141_xp toolset still missing after install' }
     if ($Needs -eq 'xp' -and -not (Test-Win71Sdk)) { throw 'Windows 7.1A SDK still missing after install' }
+}
+
+# The component being on disk is not enough: a modify rewrites the instance
+# registration, and until that settles vswhere - the same source vcvarsall
+# resolves the product from - reports no installation at all. Returning early
+# handed the next step a machine with no compiler (that is exactly how the
+# /MT job failed once the install itself started working).
+$regDeadline = (Get-Date).AddMinutes(5)
+$seen = ''
+while ((Get-Date) -lt $regDeadline) {
+    $seen = @(& $vswhere -latest -products * -property installationPath) | Select-Object -First 1
+    if ($seen) { break }
+    Write-Host '    ... waiting for the Visual Studio registration to settle'
+    Start-Sleep -Seconds 10
+}
+if ($seen) {
+    Write-Host ('    vswhere sees the installation again: ' + $seen) -ForegroundColor DarkGray
+}
+else {
+    Write-Host '    warning: vswhere still cannot see the installation; build-windows.ps1 will fall back to a disk scan' -ForegroundColor Yellow
 }
 
 Write-Host '[OK] Visual Studio components installed'

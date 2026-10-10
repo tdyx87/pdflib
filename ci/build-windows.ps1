@@ -230,30 +230,41 @@ function Enter-MsvcEnvironment {
 
     # A throwaway .bat avoids the quoting games of driving `cmd /c` with one
     # big string from PowerShell.
-    $bat = Join-Path $env:TEMP ('pdflib-vcvars-{0}.bat' -f $PID)
-    $content = "@echo off`r`n$call`r`nset`r`n"
-    Set-Content -Path $bat -Value $content -NoNewline -Encoding ASCII
-    try {
-        $captured = @(& $bat)
-        if ($LASTEXITCODE -ne 0) { throw "vcvars failed: $call" }
-    }
-    finally {
-        Remove-Item $bat -Force -ErrorAction SilentlyContinue
-    }
-    foreach ($line in $captured) {
-        $eq = $line.IndexOf('=')
-        if ($eq -gt 0) {
-            [Environment]::SetEnvironmentVariable($line.Substring(0, $eq), $line.Substring($eq + 1))
-        }
-    }
     # vcvarsall's own chatter is redirected, so it can fail without a word and
     # leave a half-built environment. The compiler on PATH is the invariant
     # that matters; assert it right here instead of letting `cmake` discover
     # the wreckage ("CMAKE_C_COMPILER cl is not a full path and was not found
-    # in the PATH") several minutes later.
-    $cl = Get-Command cl.exe -ErrorAction SilentlyContinue
+    # in the PATH") several minutes later. Retry a few times: the one time
+    # this fired in CI, vcvarsall was briefly unable to resolve the VS
+    # product after an installer modify.
+    $cl = $null
+    for ($attempt = 1; $attempt -le 3 -and -not $cl; $attempt++) {
+        $bat = Join-Path $env:TEMP ('pdflib-vcvars-{0}.bat' -f $PID)
+        $content = "@echo off`r`n$call`r`nset`r`n"
+        Set-Content -Path $bat -Value $content -NoNewline -Encoding ASCII
+        $batExit = -1
+        try {
+            $captured = @(& $bat)
+            $batExit = $LASTEXITCODE
+        }
+        finally {
+            Remove-Item $bat -Force -ErrorAction SilentlyContinue
+        }
+        if ($batExit -ne 0) { throw "vcvars failed: $call" }
+        foreach ($line in $captured) {
+            $eq = $line.IndexOf('=')
+            if ($eq -gt 0) {
+                [Environment]::SetEnvironmentVariable($line.Substring(0, $eq), $line.Substring($eq + 1))
+            }
+        }
+        $cl = Get-Command cl.exe -ErrorAction SilentlyContinue
+        if (-not $cl) {
+            Write-Host ("    vcvars gave no compiler (attempt {0}/3); retrying" -f $attempt) -ForegroundColor DarkGray
+            Start-Sleep -Seconds 15
+        }
+    }
     if (-not $cl) {
-        throw "'$call' left no C compiler on PATH - is the requested toolset installed?"
+        throw "'$call' left no C compiler on PATH after 3 attempts - is the requested toolset installed?"
     }
     Write-Host ("    -> cl from '" + $env:VCToolsInstallDir + "': " + $cl.Source) -ForegroundColor DarkGray
 }
