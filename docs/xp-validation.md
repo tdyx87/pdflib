@@ -138,13 +138,29 @@ storage and this is a documented pre-Vista limitation:
 > DLL might be loaded with `LoadLibrary`.
 > - [Thread Local Storage (TLS), Microsoft Learn](https://learn.microsoft.com/en-us/cpp/parallel/thread-local-storage-tls)
 
-`pdflibdrv.dll` does contain such variables: PoDoFo keeps its FreeType
-initializer and a recursion counter in `thread_local` storage. The fault
-lands on the first call that touches them, which is drawing text. Keep the
-linked executable (a print filter links the import library too, so it maps
-the DLL the same way and is unaffected), or eliminate the static TLS in
-the DLL - that is a change to make here, not something to work around in
-the VM.
+`pdflibdrv.dll` does carry static TLS, and the linker map names every byte
+of it (`cmake --build ... --target pdflibdrv` with `/MAP`):
+
+```
+0002:0006fd10  __tls_start          LIBCMT:tlssup.obj
+0002:0006fd14  __Init_thread_epoch  LIBCMT:thread_safe_statics.obj
+0002:0006fd18  __tls_end            LIBCMT:tlssup.obj
+```
+
+That is the static CRT's own bookkeeping. `__Init_thread_epoch` is the
+variable MSVC's thread-safe static initialization keys on, and the code
+that touches it is the guard emitted for a function-local static with a
+dynamic initializer - `podofo.lib` references `__Init_thread_header`,
+`__Init_thread_abort` and `__Init_thread_footer`, so guards like that are
+live in this DLL. The fault then lands on whichever call first runs one,
+and font/text preparation is exactly where PoDoFo builds its static
+singletons.
+
+None of this is fixable inside the VM - it decides what to change here. If
+the linked executable passes while the `LoadLibrary` one crashes, the DLL
+is usable on XP only when it is mapped together with the process (which is
+what a print filter linking the import library does), or the static TLS
+has to go.
 
 If **both** crash, the DLL has a genuine XP problem and the crash report is
 the place to start.
