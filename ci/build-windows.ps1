@@ -101,17 +101,60 @@ function Invoke-Checked {
 # toolchain discovery
 # ----------------------------------------------------------------------
 
+function Get-VsMajorFromPath {
+    param([string]$Path)
+    $year = if ($Path -match '\\(\d{4})\\') { $matches[1] } else { '' }
+    switch ($year) {
+        '2017' { return 15 }
+        '2019' { return 16 }
+        '2022' { return 17 }
+        '2026' { return 18 }
+        default { return $null }
+    }
+}
+
 function Resolve-VisualStudio {
     $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
-    if (-not (Test-Path $vswhere)) {
-        throw "vswhere.exe not found at '$vswhere' (Visual Studio Installer missing?)"
+    $path = ''
+    $version = ''
+    if (Test-Path $vswhere) {
+        # A `vs_installer modify` moments earlier can make vswhere report no
+        # installation at all while the instance registry is being rewritten -
+        # that failed a CI job which had installed its toolset seconds before.
+        # Retry; the answer becomes correct within seconds.
+        for ($attempt = 1; $attempt -le 12 -and -not $path; $attempt++) {
+            $path = @(& $vswhere -latest -products * -property installationPath) | Select-Object -First 1
+            if ($path) { break }
+            Write-Host ("    vswhere reports no installation yet; retrying ({0}/12)" -f $attempt) -ForegroundColor DarkGray
+            Start-Sleep -Seconds 10
+        }
     }
-    $path = @(& $vswhere -latest -products * -property installationPath) | Select-Object -First 1
-    $version = @(& $vswhere -latest -products * -property installationVersion) | Select-Object -First 1
+    if ($path) {
+        $version = @(& $vswhere -latest -products * -property installationVersion) | Select-Object -First 1
+    }
     if (-not $path) {
-        throw 'vswhere found no Visual Studio installation'
+        # Last resort for images/machines where vswhere is missing or stale:
+        # find the IDE layout on disk.
+        foreach ($root in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+            $base = Join-Path $root 'Microsoft Visual Studio'
+            if (-not (Test-Path $base)) { continue }
+            $hits = @(Get-ChildItem $base -Directory -ErrorAction SilentlyContinue |
+                ForEach-Object { Get-ChildItem $_.FullName -Directory -ErrorAction SilentlyContinue } |
+                Where-Object { $_.Name -in @('Community', 'Professional', 'Enterprise', 'BuildTools', 'Preview') })
+            if ($hits.Count -gt 0) {
+                $path = $hits[0].FullName
+                break
+            }
+        }
     }
-    $major = [int]([string]$version).Split('.')[0]
+    if (-not $path) {
+        throw 'no Visual Studio installation found (vswhere and a disk scan both came up empty)'
+    }
+    $major = if ([string]$version -match '^(\d+)') { [int]$matches[1] } else { Get-VsMajorFromPath $path }
+    if (-not $major) {
+        throw "found Visual Studio at '$path' but could not determine its version"
+    }
+    if (-not $version) { $version = "$major.0" }
     $generator = switch ($major) {
         15 { 'Visual Studio 15 2017' }
         16 { 'Visual Studio 16 2019' }
