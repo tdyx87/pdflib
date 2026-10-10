@@ -482,6 +482,9 @@ switch ($Variant) {
         Invoke-Checked 'XP import audit (xp smoke test)' (Python-Command @(
                 'tools/check_xp_imports.py', $dumpbin,
                 'build/xp-cmake/Release/pdflibdrv_xp_smoke.exe'))
+        Invoke-Checked 'XP import audit (xp smoke test, linked)' (Python-Command @(
+                'tools/check_xp_imports.py', $dumpbin,
+                'build/xp-cmake/Release/pdflibdrv_xp_smoke_linked.exe'))
     }
 }
 

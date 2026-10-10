@@ -10,12 +10,20 @@ itself and prints a PASS/FAIL report.
 
 ## What you need
 
-Two files, in one folder (a shared folder or a copy both work):
+Three files, in one folder (a shared folder or a copy both work):
 
 | File | Why |
 |---|---|
 | `pdflibdrv.dll` | the 32-bit XP build (`build/xp-cmake/Release/`) |
-| `pdflibdrv_xp_smoke.exe` | the test program, built with the same toolset |
+| `pdflibdrv_xp_smoke.exe` | the test program; loads the DLL with `LoadLibraryA` |
+| `pdflibdrv_xp_smoke_linked.exe` | the same test, linked against the import library |
+
+The two executables run exactly the same checks in the same order. They
+differ in one thing: the second one lists `pdflibdrv.dll` in its own
+import table, so the loader maps the DLL *before* `main()` runs, while the
+first one loads it at run time. On Windows XP those are not equivalent -
+see "When it crashes" below - and running both is what tells the two
+failure modes apart.
 
 Both come out of the `x86-xp` CI job as the **`xp-validation-bundle`**
 artifact, together with this document. A local
@@ -32,16 +40,22 @@ Copy the folder to the XP machine (or map a share), then in `cmd.exe`:
 
 ```bat
 cd \where\you\copied\them
-pdflibdrv_xp_smoke.exe
+pdflibdrv_xp_smoke.exe         > report-a.txt
+pdflibdrv_xp_smoke_linked.exe  > report-b.txt
 ```
 
-It finds `pdflibdrv.dll` next to itself. To point it somewhere else, pass
-the DLL path or a directory:
+Redirecting each report to a file makes them easy to carry back. The
+`LoadLibraryA` one finds `pdflibdrv.dll` next to itself; to point it
+somewhere else, pass the DLL path or a directory:
 
 ```bat
 pdflibdrv_xp_smoke.exe D:\driver\pdflibdrv.dll
 pdflibdrv_xp_smoke.exe D:\driver
 ```
+
+If the reports look truncated, the program is fine - output is unbuffered
+precisely so a crash cannot swallow it, and every line is written as it
+is produced.
 
 No install, no registration, no reboot: the DLL is a plain user-mode
 library, not a print driver. The program needs no arguments and writes
@@ -78,15 +92,62 @@ Then three independent groups:
    forged handles return `PD_ERR_INVALID_HANDLE` instead of crashing the
    process; `Shutdown` releases unfinished jobs and `Startup` works again.
 
-A good run ends like this:
+A good run ends like this (`36` checks for `pdflibdrv_xp_smoke.exe`, `37`
+for the linked one, which adds an export-surface check):
 
 ```
+load mode     : LoadLibraryA + GetProcAddress
+...
 RESULT: 36 check(s), 0 failure(s)
 pdflibdrv works on this machine.
 ```
 
 Exit code 0 means every check passed, 1 means at least one failed. Each
 line is self-contained, so the whole output can be pasted into a report.
+
+## When it crashes
+
+The program installs an unhandled-exception filter and prints output
+unbuffered, so a fault leaves a report like this instead of a bare dialog:
+
+```
+CRASH
+-----
+exception code : 0xc0000005 at 10024a1b -> inside pdflibdrv.dll +0x24a1b
+access violation: WRITING address 0x7ffdf000
+last call into the DLL: PdflibDrvPageDrawText
+dll base: 10000000 (1761280 bytes), exe base: 00400000 (139264 bytes)
+```
+
+That block names the faulting module, the offset inside it, whether it was
+a read or a write, the bad address, and the entry point that was executing.
+The `--crash-test` flag deliberately faults in the test program itself, so
+the report format can be checked: `pdflibdrv_xp_smoke.exe --crash-test`.
+
+Compare the two executables. **If `pdflibdrv_xp_smoke.exe` crashes but
+`pdflibdrv_xp_smoke_linked.exe` passes, the DLL is not broken on XP - it
+cannot be `LoadLibrary`ed there**, because it contains static thread-local
+storage and this is a documented pre-Vista limitation:
+
+> On Windows operating systems before Windows Vista, `__declspec(thread)`
+> has some limitations. If a DLL declares any data or object as
+> `__declspec(thread)`, it can cause a protection fault if dynamically
+> loaded. After the DLL is loaded with `LoadLibrary`, it causes system
+> failure whenever the code references the `__declspec(thread)` data. [...]
+> Use the TLS APIs, such as `TlsAlloc`, in your DLL to allocate TLS if the
+> DLL might be loaded with `LoadLibrary`.
+> - [Thread Local Storage (TLS), Microsoft Learn](https://learn.microsoft.com/en-us/cpp/parallel/thread-local-storage-tls)
+
+`pdflibdrv.dll` does contain such variables: PoDoFo keeps its FreeType
+initializer and a recursion counter in `thread_local` storage. The fault
+lands on the first call that touches them, which is drawing text. Keep the
+linked executable (a print filter links the import library too, so it maps
+the DLL the same way and is unaffected), or eliminate the static TLS in
+the DLL - that is a change to make here, not something to work around in
+the VM.
+
+If **both** crash, the DLL has a genuine XP problem and the crash report is
+the place to start.
 
 ## Reading the result
 

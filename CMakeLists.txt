@@ -254,6 +254,26 @@ if(PDFLIB_BUILD_DRIVER)
             add_test(NAME pdflibdrv_xp_smoke
                      COMMAND pdflibdrv_xp_smoke $<TARGET_FILE_DIR:pdflibdrv>)
         endif()
+
+        # Same program, linked against the .def import library instead of
+        # resolving the exports at runtime, so the loader maps the DLL
+        # before main() runs. On Windows XP that is not a stylistic
+        # difference: a DLL loaded with LoadLibrary cannot use the static
+        # TLS this one contains, and the two executables tell those two
+        # failures apart.
+        add_executable(pdflibdrv_xp_smoke_linked tools/xp_smoke_test.c)
+        target_include_directories(pdflibdrv_xp_smoke_linked PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/driver)
+        target_link_libraries(pdflibdrv_xp_smoke_linked PRIVATE pdflibdrv)
+        target_compile_definitions(pdflibdrv_xp_smoke_linked PRIVATE
+            PDFLIBDRV_SMOKE_LINK_DIRECT)
+        if(MSVC)
+            target_compile_options(pdflibdrv_xp_smoke_linked PRIVATE /W4)
+        endif()
+        if(PDFLIB_BUILD_TESTS)
+            add_test(NAME pdflibdrv_xp_smoke_linked
+                     COMMAND pdflibdrv_xp_smoke_linked)
+        endif()
     endif()
 endif()
 

@@ -105,12 +105,15 @@ jobs:
       - name: Upload the XP validation bundle
         uses: actions/upload-artifact@v4
         with:
-          # Drop these two files into a folder on a real XP machine and run
-          # the exe: it walks the whole ABI and prints a PASS/FAIL report.
-          # See docs/xp-validation.md.
+          # Drop these files into a folder on a real XP machine and run the
+          # two executables: they walk the whole ABI and print PASS/FAIL
+          # reports. One loads the DLL with LoadLibrary, the other links the
+          # import library - on XP those differ (static TLS), so running both
+          # says which of the two has failed. See docs/xp-validation.md.
           name: xp-validation-bundle
           path: |
             build/xp-cmake/Release/pdflibdrv.dll
             build/xp-cmake/Release/pdflibdrv_xp_smoke.exe
+            build/xp-cmake/Release/pdflibdrv_xp_smoke_linked.exe
             docs/xp-validation.md
           if-no-files-found: error

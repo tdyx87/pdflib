@@ -98,6 +98,92 @@ static int query_os_version(OSVERSIONINFOA *osv)
 #endif
 }
 
+/* ------------------------------------------------------------------ */
+/* crash reporting                                                    */
+/*                                                                    */
+/* A crash on the machine under test is a result like any other: the    */
+/* report has to say where it happened without a debugger. stdout is    */
+/* unbuffered, every call into the DLL is trailed, and an unhandled-    */
+/* exception filter names the module that faulted.                     */
+/* ------------------------------------------------------------------ */
+
+static const unsigned char *g_dll_base;
+static unsigned long        g_dll_size;
+static const unsigned char *g_exe_base;
+static unsigned long        g_exe_size;
+static const char          *g_last_call = "(nothing yet)";
+
+static void describe_address(const void *addr)
+{
+    const unsigned char *p = (const unsigned char *)addr;
+
+    if (g_dll_base && p >= g_dll_base && p < g_dll_base + g_dll_size) {
+        printf("inside pdflibdrv.dll +0x%lx", (unsigned long)(p - g_dll_base));
+        return;
+    }
+    if (g_exe_base && p >= g_exe_base && p < g_exe_base + g_exe_size) {
+        printf("inside the test program +0x%lx", (unsigned long)(p - g_exe_base));
+        return;
+    }
+    printf("outside both (a system DLL, or a wild pointer)");
+}
+
+static LONG WINAPI crash_report(EXCEPTION_POINTERS *ep)
+{
+    EXCEPTION_RECORD *rec = ep->ExceptionRecord;
+
+    printf("\n");
+    printf("CRASH\n");
+    printf("-----\n");
+    printf("exception code : 0x%08lx at %p -> ",
+           (unsigned long)rec->ExceptionCode, rec->ExceptionAddress);
+    describe_address(rec->ExceptionAddress);
+    printf("\n");
+    if (rec->ExceptionCode == 0xC0000005u && rec->NumberParameters >= 2) {
+        const char *kind = rec->ExceptionInformation[0] == 1 ? "WRITING" :
+                           rec->ExceptionInformation[0] == 8 ? "EXECUTING" :
+                           "READING";
+        printf("access violation: %s address 0x%08lx%s\n", kind,
+               (unsigned long)rec->ExceptionInformation[1],
+               rec->ExceptionInformation[1] == 0 ? "  (null pointer)" : "");
+    }
+    printf("last call into the DLL: %s\n", g_last_call);
+    printf("dll base: %p (%lu bytes), exe base: %p (%lu bytes)\n",
+           (const void *)g_dll_base, g_dll_size,
+           (const void *)g_exe_base, g_exe_size);
+    printf("Paste this whole block; it names the faulting call and module.\n");
+    printf("\n");
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+/* The same header walk, for the executable, so a fault address can be
+   attributed to the test program rather than to the DLL. */
+static void record_exe_range(void)
+{
+    const unsigned char *base = (const unsigned char *)GetModuleHandleA(NULL);
+    const IMAGE_DOS_HEADER *dos;
+    const IMAGE_NT_HEADERS *nt;
+
+    if (!base)
+        return;
+    dos = (const IMAGE_DOS_HEADER *)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return;
+    nt = (const IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE)
+        return;
+    g_exe_base = base;
+    g_exe_size = nt->OptionalHeader.SizeOfImage;
+}
+
+/* Records the entry point that is about to be called, so a crash report
+   can name it even when the failure is inside the DLL. */
+static void trace_call(const char *what)
+{
+    g_last_call = what;
+    printf("  ..  calling %s\n", what);
+}
+
 static void check_status(pd_status got, pd_status want, const char *what)
 {
     g_checks++;
@@ -178,6 +264,29 @@ static const char *g_expected_exports[] = {
 
 #define EXPECTED_EXPORT_COUNT 14
 
+/*
+ * Two ways to reach the ABI, chosen at build time.
+ *
+ * Default: LoadLibraryA + GetProcAddress - what a filter that loads the
+ * facade by name does, and what the ABI header explicitly allows.
+ *
+ * PDFLIBDRV_SMOKE_LINK_DIRECT: call the entry points the .def-based
+ * import library declares, so the DLL sits in this program's import table
+ * and is loaded by the loader before main() runs. On Windows XP those two
+ * are NOT equivalent: a DLL loaded with LoadLibrary cannot safely use
+ * static TLS (__declspec(thread)) there, and this DLL contains such
+ * variables - PoDoFo's FreeType init and its recursion counter. Building
+ * both executables separates "the DLL is broken here" from "the DLL
+ * cannot be LoadLibrary'd here".
+ */
+#ifdef PDFLIBDRV_SMOKE_LINK_DIRECT
+#define RESOLVE(name) ((FARPROC)(&name))
+#define SMOKE_LOAD_MODE "linked import library - DLL loaded with the process"
+#else
+#define RESOLVE(name) (GetProcAddress(dll, #name))
+#define SMOKE_LOAD_MODE "LoadLibraryA + GetProcAddress"
+#endif
+
 static int name_is_expected(const char *name)
 {
     int i;
@@ -213,6 +322,9 @@ static void check_image_and_exports(HMODULE mod, int *out_export_summary_ok)
         check(0, "loaded module has a PE header");
         return;
     }
+    /* remember the range so a crash can be attributed to this module */
+    g_dll_base = base;
+    g_dll_size = nt->OptionalHeader.SizeOfImage;
 
     printf("  machine          : %s\n",
            nt->FileHeader.Machine == IMAGE_FILE_MACHINE_I386 ? "i386 (x86)" :
@@ -302,6 +414,24 @@ static int load_the_dll(const char *exe_dir, const char *arg,
     char candidate[MAX_PATH];
     HMODULE mod;
 
+#ifdef PDFLIBDRV_SMOKE_LINK_DIRECT
+    /* The import table already pulled it in before main() ran; loading it
+       again here would defeat the point of this build. */
+    (void)exe_dir;
+    (void)arg;
+    strcpy(candidate, "pdflibdrv.dll");
+    mod = GetModuleHandleA(candidate);
+    if (!mod) {
+        printf("  GetModuleHandleA(\"%s\") failed, GetLastError=%lu\n",
+               candidate, (unsigned long)GetLastError());
+        return 0;
+    }
+    printf("  already loaded by the loader before main()\n");
+    strncpy(out_path, candidate, out_len - 1);
+    out_path[out_len - 1] = 0;
+    *out_mod = mod;
+    return 1;
+#else
     candidate[0] = 0;
     if (arg && arg[0]) {
         size_t n = strlen(arg);
@@ -337,6 +467,7 @@ static int load_the_dll(const char *exe_dir, const char *arg,
     out_path[out_len - 1] = 0;
     *out_mod = mod;
     return 1;
+#endif
 }
 
 int main(int argc, char **argv)
@@ -375,14 +506,32 @@ int main(int argc, char **argv)
     char head[8];
     char tail[16];
     unsigned long i;
+    int crash_test = 0;
+    char cwd[MAX_PATH];
 
     i = 0; /* used by the sink-failure loop below */
 
-    if (argc > 1)
+    /* Unbuffered: if this process dies mid-check, everything printed so
+       far has already left the building, and the report is the evidence. */
+    setvbuf(stdout, NULL, _IONBF, 0);
+    SetUnhandledExceptionFilter(crash_report);
+    record_exe_range();
+
+    if (argc > 1 && strcmp(argv[1], "--crash-test") == 0) {
+        crash_test = 1;
+        arg = argc > 2 ? argv[2] : NULL;
+    }
+    else if (argc > 1) {
         arg = argv[1];
+    }
 
     printf("pdflibdrv XP smoke test\n");
-    printf("=======================\n\n");
+    printf("=======================\n");
+    printf("load mode     : %s\n\n", SMOKE_LOAD_MODE);
+
+    cwd[0] = 0;
+    GetCurrentDirectoryA(sizeof(cwd), cwd);
+    printf("working dir   : %s\n", cwd);
 
     /* --- where am I running? --------------------------------------- */
     query_os_version(&osv);
@@ -397,6 +546,14 @@ int main(int argc, char **argv)
         printf("                -> NOT XP; a pass here is weaker evidence\n");
     printf("\n");
 
+    if (crash_test) {
+        volatile unsigned char *nowhere = (volatile unsigned char *)0;
+        printf("--crash-test: faulting on purpose, so this report can be\n");
+        printf("   compared with the one a real crash produces.\n");
+        *nowhere = 1;
+        printf("the null write did not fault - the handler is not working\n");
+    }
+
     GetModuleFileNameA(NULL, exe_path, sizeof(exe_path));
     strcpy(exe_dir, exe_path);
     slash = strrchr(exe_dir, '\\');
@@ -408,12 +565,12 @@ int main(int argc, char **argv)
 
     /* --- 1. load it ------------------------------------------------- */
     if (!load_the_dll(exe_dir, arg, dll_path, sizeof(dll_path), &dll)) {
-        check(0, "pdflibdrv.dll loaded with LoadLibraryA");
+        check(0, "pdflibdrv.dll is reachable");
         printf("\nPlace pdflibdrv.dll next to this exe, or pass its path.\n");
         printf("RESULT: %d check(s), %d failure(s)\n", g_checks, g_failures);
         return 1;
     }
-    check(1, "pdflibdrv.dll loaded with LoadLibraryA");
+    check(1, "pdflibdrv.dll is reachable (" SMOKE_LOAD_MODE ")");
     printf("  path           : %s\n", dll_path);
     printf("  module base    : %p\n", (void *)dll);
 
@@ -422,44 +579,58 @@ int main(int argc, char **argv)
 
     /* --- 3. the 14 names resolve by name --------------------------- */
     p_get_abi = (void (PDCALL *)(unsigned int *, unsigned int *))
-        (void *)GetProcAddress(dll, "PdflibDrvGetAbiVersion");
+        (void *)RESOLVE(PdflibDrvGetAbiVersion);
     p_version_string = (const char *(PDCALL *)(void))
-        (void *)GetProcAddress(dll, "PdflibDrvVersionString");
+        (void *)RESOLVE(PdflibDrvVersionString);
     g_status_string = (const char *(PDCALL *)(pd_status))
-        (void *)GetProcAddress(dll, "PdflibDrvStatusString");
+        (void *)RESOLVE(PdflibDrvStatusString);
     p_startup = (pd_status (PDCALL *)(void))
-        (void *)GetProcAddress(dll, "PdflibDrvStartup");
+        (void *)RESOLVE(PdflibDrvStartup);
     p_shutdown = (void (PDCALL *)(void))
-        (void *)GetProcAddress(dll, "PdflibDrvShutdown");
+        (void *)RESOLVE(PdflibDrvShutdown);
     p_job_create = (pd_status (PDCALL *)(const char *, pd_write_fn, void *, pd_doc *))
-        (void *)GetProcAddress(dll, "PdflibDrvJobCreate");
+        (void *)RESOLVE(PdflibDrvJobCreate);
     p_job_finish = (pd_status (PDCALL *)(pd_doc))
-        (void *)GetProcAddress(dll, "PdflibDrvJobFinish");
+        (void *)RESOLVE(PdflibDrvJobFinish);
     p_job_abort = (pd_status (PDCALL *)(pd_doc))
-        (void *)GetProcAddress(dll, "PdflibDrvJobAbort");
+        (void *)RESOLVE(PdflibDrvJobAbort);
     p_job_last_error = (const char *(PDCALL *)(pd_doc))
-        (void *)GetProcAddress(dll, "PdflibDrvJobLastError");
+        (void *)RESOLVE(PdflibDrvJobLastError);
     p_page_add = (pd_status (PDCALL *)(pd_doc, double, double, pd_page *))
-        (void *)GetProcAddress(dll, "PdflibDrvPageAdd");
+        (void *)RESOLVE(PdflibDrvPageAdd);
     p_page_rotation = (pd_status (PDCALL *)(pd_page, int))
-        (void *)GetProcAddress(dll, "PdflibDrvPageSetRotation");
+        (void *)RESOLVE(PdflibDrvPageSetRotation);
     p_draw_text = (pd_status (PDCALL *)(pd_page, unsigned int, const char *, double, double, double))
-        (void *)GetProcAddress(dll, "PdflibDrvPageDrawText");
+        (void *)RESOLVE(PdflibDrvPageDrawText);
     p_draw_rect = (pd_status (PDCALL *)(pd_page, double, double, double, double, unsigned int))
-        (void *)GetProcAddress(dll, "PdflibDrvPageDrawRect");
+        (void *)RESOLVE(PdflibDrvPageDrawRect);
     p_draw_line = (pd_status (PDCALL *)(pd_page, double, double, double, double))
-        (void *)GetProcAddress(dll, "PdflibDrvPageDrawLine");
+        (void *)RESOLVE(PdflibDrvPageDrawLine);
 
     check(p_get_abi && p_version_string && g_status_string && p_startup &&
           p_shutdown && p_job_create && p_job_finish && p_job_abort &&
           p_job_last_error && p_page_add && p_page_rotation && p_draw_text &&
           p_draw_rect && p_draw_line,
-          "all 14 exports resolve through GetProcAddress by literal name");
+          "all 14 entry points are callable (" SMOKE_LOAD_MODE ")");
+#ifdef PDFLIBDRV_SMOKE_LINK_DIRECT
+    {
+        int missing = 0;
+        int k;
+        for (k = 0; k < EXPECTED_EXPORT_COUNT; k++) {
+            if (!GetProcAddress(dll, g_expected_exports[k]))
+                missing++;
+        }
+        check(missing == 0,
+              "all 14 names are still exported under their literal name");
+    }
+#endif
 
     if (!p_startup || !p_job_create || !p_job_finish) {
         printf("\nRESULT: %d check(s), %d failure(s) - cannot continue\n",
                g_checks, g_failures);
+#ifndef PDFLIBDRV_SMOKE_LINK_DIRECT
         FreeLibrary(dll);
+#endif
         return 1;
     }
 
@@ -488,19 +659,29 @@ int main(int argc, char **argv)
     check(job != NULL, "the job handle is not NULL");
 
     if (st == PD_OK && job) {
-        check_status(p_page_add(job, 595.0, 842.0, &page), PD_OK,
-                     "PdflibDrvPageAdd (A4)");
+        trace_call("PdflibDrvPageAdd");
+        st = p_page_add(job, 595.0, 842.0, &page);
+        check_status(st, PD_OK, "PdflibDrvPageAdd (A4)");
         check(page != NULL, "the page handle is not NULL");
-        check_status(p_draw_text(page, PD_FONT_HELVETICA,
-                                 "Hello from Windows XP", 72.0, 720.0, 18.0),
-                     PD_OK, "PdflibDrvPageDrawText");
-        check_status(p_draw_rect(page, 72.0, 600.0, 200.0, 60.0, PD_PAINT_FILL_STROKE),
-                     PD_OK, "PdflibDrvPageDrawRect");
-        check_status(p_draw_line(page, 72.0, 560.0, 400.0, 560.0), PD_OK,
-                     "PdflibDrvPageDrawLine");
-        check_status(p_page_rotation(page, 90), PD_OK,
-                     "PdflibDrvPageSetRotation");
 
+        trace_call("PdflibDrvPageDrawText");
+        st = p_draw_text(page, PD_FONT_HELVETICA,
+                         "Hello from Windows XP", 72.0, 720.0, 18.0);
+        check_status(st, PD_OK, "PdflibDrvPageDrawText");
+
+        trace_call("PdflibDrvPageDrawRect");
+        st = p_draw_rect(page, 72.0, 600.0, 200.0, 60.0, PD_PAINT_FILL_STROKE);
+        check_status(st, PD_OK, "PdflibDrvPageDrawRect");
+
+        trace_call("PdflibDrvPageDrawLine");
+        st = p_draw_line(page, 72.0, 560.0, 400.0, 560.0);
+        check_status(st, PD_OK, "PdflibDrvPageDrawLine");
+
+        trace_call("PdflibDrvPageSetRotation");
+        st = p_page_rotation(page, 90);
+        check_status(st, PD_OK, "PdflibDrvPageSetRotation");
+
+        trace_call("PdflibDrvJobFinish");
         st = p_job_finish(job);
         check_status(st, PD_OK, "PdflibDrvJobFinish");
         job = NULL;
@@ -617,7 +798,9 @@ int main(int argc, char **argv)
     }
 
     p_shutdown();
+#ifndef PDFLIBDRV_SMOKE_LINK_DIRECT
     FreeLibrary(dll);
+#endif
 
     printf("\nRESULT: %d check(s), %d failure(s)\n", g_checks, g_failures);
     if (g_failures == 0) {
