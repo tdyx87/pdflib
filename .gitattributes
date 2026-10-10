@@ -1,5 +1,8 @@
 # cmd.exe is happiest with CRLF batch files; without this, a clone made
 # with core.autocrlf=false would get LF-only .cmd and %~dp0/label parsing
 # can go wrong. Keep them CRLF regardless of the machine's git config.
+# PowerShell reads either ending, but these are Windows-only scripts run
+# next to the .cmd files; keep them uniform with the batches above.
 *.cmd text eol=crlf
 *.bat text eol=crlf
+*.ps1 text eol=crlf

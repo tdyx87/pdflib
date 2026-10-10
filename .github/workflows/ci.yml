@@ -1,0 +1,104 @@
+name: CI
+
+# Reproduces the three pdflibdrv configurations that build-*.cmd produce,
+# on a Windows runner:
+#
+#   x64 /MD   all backends + driver  -> full ctest + driver contract test
+#   x64 /MT   static CRT             -> full ctest + export/CRT guards
+#   x86 + XP  v141_xp static CRT     -> ctest + import-table audit
+#
+# All three go through ci/build-windows.ps1, which discovers Visual Studio
+# instead of hard-coding the development machine's paths. See it for the
+# per-variant command lines and docs/pdflibdrv-abi.md for the background.
+#
+# The runner is `windows-2022` (VS2022) by default. Repo variable
+# WINDOWS_RUNNER can point every job at a self-hosted machine that already
+# has the VS2017 + Windows 7.1A SDK toolchain; the hosted-only provisioning
+# step then becomes a no-op.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CONAN_VERSION: '2.25.2'
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
+
+jobs:
+  x64-md:
+    name: x64 /MD - all backends + driver
+    runs-on: ${{ vars.WINDOWS_RUNNER || 'windows-2022' }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install conan and build tools
+        run: python -m pip install "conan==${{ env.CONAN_VERSION }}" meson ninja
+      - name: Build and test
+        shell: pwsh
+        run: ./ci/build-windows.ps1 -Variant md
+      - name: Upload pdflibdrv.dll
+        uses: actions/upload-artifact@v4
+        with:
+          name: pdflibdrv-x64-md
+          path: build/all-backends/pdflibdrv.dll
+          if-no-files-found: error
+
+  x64-mt:
+    name: x64 /MT - static CRT
+    runs-on: ${{ vars.WINDOWS_RUNNER || 'windows-2022' }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install conan and build tools
+        run: python -m pip install "conan==${{ env.CONAN_VERSION }}" meson ninja
+      - name: Ensure the v141 compiler is installed
+        shell: pwsh
+        run: ./ci/ensure-vs-components.ps1 -Needs v141
+      - name: Build and test
+        shell: pwsh
+        run: ./ci/build-windows.ps1 -Variant mt
+      - name: Upload pdflibdrv.dll
+        uses: actions/upload-artifact@v4
+        with:
+          name: pdflibdrv-x64-mt
+          path: build/mt-cmake/pdflibdrv.dll
+          if-no-files-found: error
+
+  x86-xp:
+    name: x86 + Windows XP - v141_xp static CRT
+    runs-on: ${{ vars.WINDOWS_RUNNER || 'windows-2022' }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install conan and build tools
+        run: python -m pip install "conan==${{ env.CONAN_VERSION }}" meson ninja
+      - name: Ensure the v141_xp toolset is installed
+        shell: pwsh
+        run: ./ci/ensure-vs-components.ps1 -Needs xp
+      - name: Build, test and audit for XP
+        shell: pwsh
+        run: ./ci/build-windows.ps1 -Variant x86xp
+      - name: Upload pdflibdrv.dll
+        uses: actions/upload-artifact@v4
+        with:
+          name: pdflibdrv-x86-xp
+          path: build/xp-cmake/Release/pdflibdrv.dll
+          if-no-files-found: error

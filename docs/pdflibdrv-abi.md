@@ -24,6 +24,9 @@ tested before they get anywhere near a printer.
 | [build-mt.cmd](../build-mt.cmd) | static-CRT x64 build (`profiles/win-x64-static-release`) |
 | [build-x86-xp.cmd](../build-x86-xp.cmd) | 32-bit Windows XP build (`profiles/win-x86-xp-static-release`) |
 | [tools/check_xp_imports.py](../tools/check_xp_imports.py) | import-table audit for XP (no missing DLL, no post-XP API) |
+| [.github/workflows/ci.yml](../.github/workflows/ci.yml) | GitHub Actions: the three configurations below, on a Windows runner |
+| [ci/build-windows.ps1](../ci/build-windows.ps1) | the shared build+test entry point that workflow runs (also runnable locally) |
+| [ci/ensure-vs-components.ps1](../ci/ensure-vs-components.ps1) | installs the v141 / v141_xp VS components on a hosted runner (a no-op elsewhere) |
 
 ## Design in one screen
 
@@ -257,6 +260,53 @@ audit flagged it immediately. [driver/pdflibdrv.cpp](../driver/pdflibdrv.cpp)
 now uses the same `InterlockedCompareExchange` state machine as
 `pdf_ensure_backends()` in the core, which is XP-safe (and the x64 `/MT`
 DLL was rebuilt and re-audited clean afterwards).
+
+## Continuous integration - `.github/workflows/ci.yml`
+
+Three jobs, one per configuration, each going through
+[ci/build-windows.ps1](../ci/build-windows.ps1) rather than a copy of the
+`.cmd` logic - so CI and `build-*.cmd` cannot drift apart:
+
+| Job | Variant | What it runs |
+|---|---|---|
+| `x64-md` | `/MD`, all backends | full `ctest` + the driver contract test |
+| `x64-mt` | `/MT`, podofo only | full `ctest` + the export-table and no-dynamic-CRT guards |
+| `x86-xp` | `v141_xp`, static CRT | full `ctest` + [tools/check_xp_imports.py](../tools/check_xp_imports.py) |
+
+[ci/build-windows.ps1](../ci/build-windows.ps1) is the part worth reading.
+It finds Visual Studio with `vswhere` (no hard-coded IDE path or drive
+letter), activates the matching MSVC prompt - `-vcvars_ver=14.16` when the
+IDE is newer than 2017, because both static-CRT profiles pin
+`compiler.version=191` - resolves a working conan CLI, and then runs the
+per-variant stages. It needs `cmake` and `ninja` on `PATH`, conan
+installed for some Python, and that Python passed as `-Python <python.exe>`
+when the machine's `conan.exe` launcher is broken (see the gotcha above).
+
+Two things a *hosted* runner forces, both because it has no VS2017:
+
+* `-c tools.microsoft.msbuild:vs_version=<major> -c tools.microsoft:msvc_update=6`
+  on the conan command line. Without it, `compiler.version=191` makes
+  conan hunt for a VS2017 install and `VCVars` fails with *"VS
+  non-existing installation: Visual Studio 15"*; the conf is exactly the
+  escape hatch conan's own error message names.
+* `-c tools.cmake.cmaketoolchain:generator="Visual Studio 17 2022"` for
+  the XP install, since [profiles/win-x86-xp-static-release](../profiles/win-x86-xp-static-release)
+  pins the VS2017 generator and the v141_xp toolset is an MSBuild concept
+  that cannot follow a generator rename on its own.
+
+The XP and `/MT` jobs also need the `Microsoft.VisualStudio.Component.VC.v141.x86.x64`
+and `Microsoft.VisualStudio.Component.WinXP` components, neither of which
+ships on a `windows-*` image. [ci/ensure-vs-components.ps1](../ci/ensure-vs-components.ps1)
+adds them through `vs_installer.exe` **only** when
+`RUNNER_ENVIRONMENT=github-hosted` and they are missing; on a developer
+machine it just reports what it found and exits. Set the repository
+variable `WINDOWS_RUNNER` (e.g. to `self-hosted`) to point all three jobs
+at a machine that already has the VS2017 + Windows 7.1A SDK toolchain,
+where that provisioning step is a no-op.
+
+**Not verified by this**: none of these builds have ever been *run* on
+XP, and a green CI run on Windows Server 2022 says nothing about the WDK
+7600 print stack - see "Known gaps" below.
 
 ## What is verified (this checkout, VS2017 14.16 x64, PoDoFo 0.9.x)
 

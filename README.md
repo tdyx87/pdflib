@@ -69,8 +69,9 @@ ctest --test-dir build/all-backends --output-on-failure
 
 - `libharu/2.4.4` (option `with_libharu`)
 - `podofo-local/0.9.7` (option `with_podofo`) — a local recipe in
-  `recipes/podofo/all/`, exported with
-  `conan export recipes/podofo/all podofo-local/0.9.7@`
+  `recipes/podofo/all/`, exported with `conan export recipes/podofo/all`
+  (the recipe itself carries `name`/`version`; the `conan export <path>
+  <ref>@` form is Conan 1 syntax and is rejected by Conan 2)
 
 Disable either one to ship a lighter binary — the registry simply won't
 contain that engine, and `pdflib_set_backend()` reports
@@ -103,6 +104,22 @@ ctest --preset core-only
 This builds the core plus the `dummy` backend, which accepts every call
 and is used by the unit tests. Useful for CI, fuzzing the API surface,
 and as a template for new backends.
+
+### 3) Continuous integration
+
+[.github/workflows/ci.yml](.github/workflows/ci.yml) runs the three
+pdflibdrv configurations on a Windows runner - x64 `/MD`, x64 `/MT` and
+x86 + Windows XP - each through the shared, path-agnostic
+[ci/build-windows.ps1](ci/build-windows.ps1). That script locates Visual
+Studio itself, so it also runs locally:
+
+```powershell
+# cmake and ninja must be on PATH
+./ci/build-windows.ps1 -Variant md|mt|x86xp
+```
+
+See [docs/pdflibdrv-abi.md](docs/pdflibdrv-abi.md) for what each job
+checks and how a hosted runner gets the VS2017 / `v141_xp` toolchain.
 
 ## Output modes & font embedding
 
