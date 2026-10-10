@@ -203,7 +203,16 @@ function Enter-MsvcEnvironment {
             [Environment]::SetEnvironmentVariable($line.Substring(0, $eq), $line.Substring($eq + 1))
         }
     }
-    Write-Host ("    -> cl from '" + $env:VCToolsInstallDir + "'") -ForegroundColor DarkGray
+    # vcvarsall's own chatter is redirected, so it can fail without a word and
+    # leave a half-built environment. The compiler on PATH is the invariant
+    # that matters; assert it right here instead of letting `cmake` discover
+    # the wreckage ("CMAKE_C_COMPILER cl is not a full path and was not found
+    # in the PATH") several minutes later.
+    $cl = Get-Command cl.exe -ErrorAction SilentlyContinue
+    if (-not $cl) {
+        throw "'$call' left no C compiler on PATH - is the requested toolset installed?"
+    }
+    Write-Host ("    -> cl from '" + $env:VCToolsInstallDir + "': " + $cl.Source) -ForegroundColor DarkGray
 }
 
 function Resolve-Dumpbin {
@@ -233,11 +242,26 @@ $conan = Resolve-Conan
 $py = @(Resolve-PythonCommand $conan)
 
 $arch = if ($Variant -eq 'x86xp') { 'x86' } else { 'amd64' }
-# VS2017's default toolset *is* v141; newer IDEs also ship v143, so they
-# need -vcvars_ver=14.16 to get the compiler both /MT profiles pin.
-$vcvarsVer = if ($vs.Major -ge 16) { '14.16' } else { '' }
 $vcvarsAll = Join-Path $vs.Path 'VC\Auxiliary\Build\vcvarsall.bat'
 if (-not (Test-Path $vcvarsAll)) { throw "vcvarsall.bat not found: $vcvarsAll" }
+
+# `md` builds with whatever the IDE ships - the auto-detected default conan
+# profile agrees with it. `mt` and `x86xp` pin compiler.version=191, so they
+# need the v141 (14.16) toolset: VS2017 has it as its default, a newer IDE
+# needs it installed *and* selected explicitly. Asking a newer IDE for a
+# toolset it does not have makes vcvarsall fail, and since its output is
+# redirected the only symptom is "cl not found" much later - so check first.
+$vcvarsVer = ''
+if ($Variant -ne 'md' -and $vs.Major -ge 16) {
+    $toolsRoot = Join-Path $vs.Path 'VC\Tools\MSVC'
+    $v141 = @(Get-ChildItem $toolsRoot -Directory -Filter '14.16*' -ErrorAction SilentlyContinue)
+    if (-not $v141) {
+        $component = if ($Variant -eq 'x86xp') { 'xp' } else { 'v141' }
+        throw ("variant '$Variant' needs the v141 (14.16) toolset, but '$toolsRoot' has no 14.16* " +
+               "toolset. Run ci/ensure-vs-components.ps1 -Needs $component first, or use a runner that has it.")
+    }
+    $vcvarsVer = '14.16'
+}
 
 # NB: the extra-argument parameters below must not be called $Args: that
 # name is PowerShell's automatic argument variable, and binding silently

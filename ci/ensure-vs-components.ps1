@@ -91,15 +91,30 @@ function Test-Needed {
 }
 
 function Show-InstallerLogs {
-    <# the installer keeps its real diagnosis in %TEMP%\dd_*.log #>
-    $logs = @(Get-ChildItem -Path $env:TEMP -Filter 'dd_*.log' -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending | Select-Object -First 2)
-    foreach ($l in $logs) {
-        Write-Host ''
-        Write-Host ("--- tail of " + $l.Name) -ForegroundColor Yellow
-        Get-Content -Path $l.FullName -Tail 40 -ErrorAction SilentlyContinue |
-            ForEach-Object { Write-Host ("    " + $_) }
+    <# The installer keeps its real diagnosis in %TEMP%\dd_*.log - and the
+       useful line comes *before* the boilerplate usage list, so a plain tail
+       is not enough (it was all we printed the first time, and it hid the
+       rejected argument behind 40 lines of "Command: --xxx. Usage: ..."). #>
+    $logs = @(Get-ChildItem -Path $env:TEMP -Filter 'dd_installer_*.log' -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending)
+    if ($logs.Count -eq 0) {
+        $logs = @(Get-ChildItem -Path $env:TEMP -Filter 'dd_*.log' -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending)
     }
+    if ($logs.Count -eq 0) {
+        Write-Host '    (no dd_*.log in %TEMP%)' -ForegroundColor Yellow
+        return
+    }
+    $log = $logs[0]
+    Write-Host ''
+    Write-Host ("--- " + $log.Name + ": error-looking lines") -ForegroundColor Yellow
+    Select-String -Path $log.FullName -ErrorAction SilentlyContinue `
+        -Pattern 'rror|exit code|Unrecognized|unrecognized|not recognized|Invalid|invalid parameter|Failure|failed' |
+        Select-Object -First 30 |
+        ForEach-Object { Write-Host ("    " + $_.Line.Trim()) }
+    Write-Host ("--- " + $log.Name + ": last 12 lines") -ForegroundColor Yellow
+    Get-Content -Path $log.FullName -Tail 12 -ErrorAction SilentlyContinue |
+        ForEach-Object { Write-Host ("    " + $_) }
 }
 
 $haveV141 = (Test-V141Tools) -and -not $ForceMissing
@@ -133,7 +148,11 @@ if (-not $DryRun -and $env:RUNNER_ENVIRONMENT -ne 'github-hosted') {
 $installer = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vs_installer.exe'
 if (-not (Test-Path $installer)) { throw "vs_installer.exe not found at '$installer'" }
 
-$installerArgs = @('modify', '--installPath', $vsPath, '--quiet', '--norestart', '--nocache', '--wait')
+# No --wait: it is a bootstrapper argument, not one the `modify` path
+# accepts - passing it fails the whole modify with exit code 87 (invalid
+# parameter) and the component never lands. Waiting is done by polling for
+# the component below, which is what actually tells us the install finished.
+$installerArgs = @('modify', '--installPath', $vsPath, '--quiet', '--norestart', '--nocache')
 foreach ($c in $missing) { $installerArgs += @('--add', $c) }
 
 Write-Host ''
