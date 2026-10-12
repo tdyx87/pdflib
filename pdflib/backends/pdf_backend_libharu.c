@@ -45,6 +45,7 @@ typedef struct haru_annot
     HPDF_Page page;       /* owning page */
     HPDF_Doc pdf;
     HPDF_Annotation annot;
+    pdf_annot_type type;  /* needed to gate subtype-only setters */
     pdf_rect rect;        /* kept for deferred link creation */
     int link_created;
 } haru_annot;
@@ -67,19 +68,48 @@ typedef struct haru_outline
 
 /* ----- small helpers ----------------------------------------------------- */
 
-static pdf_status haru_rc(HPDF_STATUS st, haru_doc *d)
+/* Fail a call AND clear libharu's latched document error.
+ *
+ * libharu latches the first error on the document: while it is set,
+ * HPDF_CheckError() turns every subsequent API call into a silent no-op
+ * that still reports success. A function that returns NULL and leaves the
+ * latch set therefore does not merely report one failure - it disables the
+ * whole document from that point on.
+ *
+ * That is not hypothetical. libharu cannot read a .ttc (TrueType
+ * collection); HPDF_LoadTTFontFromFile fails with HPDF_INVALID_TTC_FILE,
+ * and the early return here used to leave that error latched. Every later
+ * page_add, draw and image call then did nothing at all while returning
+ * PDF_OK, so the document silently came out empty. PoDoFo has no such
+ * latch and recovered normally, which made the two engines behave
+ * completely differently after one failed call - the exact class of
+ * inconsistency this DLL exists to remove.
+ *
+ * Clearing it restores the contract the rest of pdflib relies on: a failed
+ * call reports a status and leaves the document usable. */
+static pdf_status haru_fail(haru_doc *d, const char *what)
 {
-    if (st == HPDF_OK)
-        return PDF_OK;
     if (d)
     {
         HPDF_STATUS code = HPDF_GetError(d->pdf);
         HPDF_STATUS detail = HPDF_GetErrorDetail(d->pdf);
-        snprintf(d->error, sizeof(d->error), "libharu error 0x%lx (detail 0x%lx)",
-                 (unsigned long)code, (unsigned long)detail);
+
+        if (code != HPDF_OK || detail != HPDF_OK)
+            snprintf(d->error, sizeof(d->error),
+                     "libharu: %s failed (error 0x%lx, detail 0x%lx)", what,
+                     (unsigned long)code, (unsigned long)detail);
+        else
+            snprintf(d->error, sizeof(d->error), "libharu: %s failed", what);
         HPDF_ResetError(d->pdf);
     }
     return PDF_ERR_BACKEND_FAILED;
+}
+
+static pdf_status haru_rc(HPDF_STATUS st, haru_doc *d)
+{
+    if (st == HPDF_OK)
+        return PDF_OK;
+    return haru_fail(d, "operation");
 }
 
 static pdf_color normalize_color(const pdf_color *c)
@@ -479,7 +509,7 @@ static pdf_status h_page_add(pdf_backend_doc *doc, double w, double h,
     haru_page *payload;
 
     if (!page)
-        return PDF_ERR_BACKEND_FAILED;
+        return haru_fail(d, "HPDF_AddPage");
 
     if (haru_rc(HPDF_Page_SetWidth(page, (HPDF_REAL)w), d) != PDF_OK
         || haru_rc(HPDF_Page_SetHeight(page, (HPDF_REAL)h), d) != PDF_OK)
@@ -539,6 +569,13 @@ static pdf_status make_font_cell(HPDF_Font font, pdf_font *out_font)
     haru_font *payload;
     const pdf_backend_vtable *vt = &g_libharu_vt;
 
+    /* Every caller hands over the result of an HPDF_* font call, and all
+     * of them can return NULL. Wrapping NULL in a "successful" cell would
+     * only move the failure to the first draw call, where it is a crash
+     * instead of an error code. */
+    if (!font)
+        return PDF_ERR_BACKEND_FAILED;
+
     payload = (haru_font *)calloc(1, sizeof(*payload));
     if (!payload)
         return PDF_ERR_OUT_OF_MEMORY;
@@ -567,7 +604,7 @@ static pdf_status h_font_get_std(pdf_backend_doc *doc, pdf_std_font font,
         encoding = "FontSpecific";
     f = HPDF_GetFont(d->pdf, name, encoding);
     if (!f)
-        return PDF_ERR_BACKEND_FAILED;
+        return haru_fail(d, "HPDF_GetFont");
     return make_font_cell(f, out_font);
 }
 
@@ -583,8 +620,16 @@ static pdf_status h_font_load_ttf(pdf_backend_doc *doc, const char *path,
                                              * into HPDF_LoadTTFontFromFile) */
     name = HPDF_LoadTTFontFromFile(d->pdf, path, HPDF_TRUE);
     if (!name)
-        return PDF_ERR_BACKEND_FAILED;
-    return make_font_cell(HPDF_GetFont(d->pdf, name, "UTF-8"), out_font);
+        return haru_fail(d, "HPDF_LoadTTFontFromFile");
+    {
+        /* HPDF_GetFont can fail too (e.g. an encoding libharu does not
+         * know), and make_font_cell has no doc to clear the latch with. */
+        HPDF_Font f = HPDF_GetFont(d->pdf, name, "UTF-8");
+
+        if (!f)
+            return haru_fail(d, "HPDF_GetFont(loaded TTF)");
+        return make_font_cell(f, out_font);
+    }
 }
 
 static pdf_status h_font_load_ttf_memory(pdf_backend_doc *doc,
@@ -869,7 +914,7 @@ static pdf_status h_set_opacity(pdf_page page, double fill_alpha,
     HPDF_ExtGState gs = HPDF_CreateExtGState(d->pdf);
 
     if (!gs)
-        return PDF_ERR_BACKEND_FAILED;
+        return haru_fail(d, "HPDF_CreateExtGState");
     HPDF_ExtGState_SetAlphaFill(gs, (HPDF_REAL)fill_alpha);
     HPDF_ExtGState_SetAlphaStroke(gs, (HPDF_REAL)stroke_alpha);
     return haru_rc(HPDF_Page_SetExtGState(page_of(page), gs), d) == PDF_OK
@@ -892,7 +937,7 @@ static pdf_status h_set_blend_mode(pdf_page page, pdf_blend_mode mode)
         return PDF_ERR_INVALID_PARAM;
     gs = HPDF_CreateExtGState(d->pdf);
     if (!gs)
-        return PDF_ERR_BACKEND_FAILED;
+        return haru_fail(d, "HPDF_CreateExtGState");
     HPDF_ExtGState_SetBlendMode(gs, map[(int)mode]);
     return haru_rc(HPDF_Page_SetExtGState(page_of(page), gs), d) == PDF_OK
                ? PDF_OK
@@ -1046,7 +1091,7 @@ static pdf_status h_image_load_memory(pdf_backend_doc *doc,
         img = HPDF_LoadJpegImageFromMem(d->pdf, data, (HPDF_UINT)size);
     }
     if (!img)
-        return PDF_ERR_BACKEND_FAILED;
+        return haru_fail(d, "image decode (neither PNG nor JPEG)");
 
     payload = (haru_image *)calloc(1, sizeof(*payload));
     if (!payload)
@@ -1142,6 +1187,21 @@ static pdf_status h_annot_create(pdf_page page, pdf_annot_type type,
                                             NULL);
             break;
         case PDF_ANNOT_LINK_URI:
+            /* The API contract is that the URL arrives in `content`, and
+             * the PoDoFo backend materialises the link right here. Doing
+             * the same keeps set_color/author/subject usable straight away
+             * - formerly the deferred path left payload->annot NULL, so
+             * the annotation silently never reached the output PDF unless
+             * the caller also called annot_link_to_page. */
+            if (content && *content)
+            {
+                a = HPDF_Page_CreateURILinkAnnot(p, hr, content);
+                if (!a)
+                    return haru_fail(d, "HPDF_Page_CreateURILinkAnnot");
+                break; /* fall through to the shared payload setup */
+            }
+            /* no URL supplied: fall through to the deferred path */
+            /* fallthrough */
         case PDF_ANNOT_LINK_GOTO:
         {
             /* libharu creates links in one shot; defer to the
@@ -1151,6 +1211,7 @@ static pdf_status h_annot_create(pdf_page page, pdf_annot_type type,
                 return PDF_ERR_OUT_OF_MEMORY;
             payload->page = p;
             payload->pdf = d->pdf;
+            payload->type = type;
             payload->rect = *rect;
             payload->link_created = 0;
             payload->annot = NULL;
@@ -1170,7 +1231,38 @@ static pdf_status h_annot_create(pdf_page page, pdf_annot_type type,
     }
 
     if (!a)
-        return PDF_ERR_BACKEND_FAILED;
+        return haru_fail(d, "HPDF_Page_Create*Annot");
+
+    /* Highlight / Underline / Squiggly / StrikeOut are *text markup*
+     * annotations, and the PDF spec makes /QuadPoints REQUIRED on them:
+     * the quadrilateral is what tells the viewer which region to mark up.
+     * libharu's HPDF_Page_Create*Annot helpers build the dictionary and
+     * the /Rect but never write /QuadPoints, so a markup annotation made
+     * without this call is one a viewer cannot place at all - MuPDF, for
+     * one, falls back to a rectangle of INT_MIN..INT_MAX.
+     *
+     * Mind the argument order. The parameters are NAMED lb, rb, rt, lt
+     * (left-bottom, right-bottom, right-top, left-top), but libharu
+     * writes the four points into the array in the order they are passed,
+     * without reordering. The spec wants (upper-left, upper-right,
+     * lower-left, lower-right), so the arguments below are passed in THAT
+     * order and the names are simply wrong for this call. Passing them in
+     * the order the names suggest produces a crossed quadrilateral: the
+     * annotation is then placed at a bogus rectangle, which is exactly
+     * what the showcase's independent cross-check caught. */
+    if (type == PDF_ANNOT_HIGHLIGHT || type == PDF_ANNOT_UNDERLINE ||
+        type == PDF_ANNOT_SQUIGGLY  || type == PDF_ANNOT_STRIKEOUT)
+    {
+        HPDF_Point ul, ur, ll, lr;
+
+        ul.x = hr.left;  ul.y = hr.top;
+        ur.x = hr.right; ur.y = hr.top;
+        ll.x = hr.left;  ll.y = hr.bottom;
+        lr.x = hr.right; lr.y = hr.bottom;
+
+        if (HPDF_TextMarkupAnnot_SetQuadPoints(a, ul, ur, ll, lr) != HPDF_OK)
+            return haru_fail(d, "HPDF_TextMarkupAnnot_SetQuadPoints");
+    }
 
     payload = (haru_annot *)calloc(1, sizeof(*payload));
     if (!payload)
@@ -1178,6 +1270,7 @@ static pdf_status h_annot_create(pdf_page page, pdf_annot_type type,
     payload->page = p;
     payload->pdf = d->pdf;
     payload->annot = a;
+    payload->type = type;
     payload->rect = *rect;
     payload->link_created = 0;
 
@@ -1211,7 +1304,7 @@ static pdf_status h_annot_link_to_page(pdf_annot annot, pdf_page *dest,
     {
         created = HPDF_Page_CreateURILinkAnnot(a->page, hr, uri);
         if (!created)
-            return PDF_ERR_BACKEND_FAILED;
+            return haru_fail(d, "HPDF_Page_CreateURILinkAnnot");
     }
     else if (dest)
     {
@@ -1221,7 +1314,7 @@ static pdf_status h_annot_link_to_page(pdf_annot annot, pdf_page *dest,
             return PDF_ERR_BACKEND_FAILED;
         created = HPDF_Page_CreateLinkAnnot(a->page, hr, dst);
         if (!created)
-            return PDF_ERR_BACKEND_FAILED;
+            return haru_fail(d, "HPDF_Page_CreateLinkAnnot");
     }
     else
     {
@@ -1233,6 +1326,16 @@ static pdf_status h_annot_link_to_page(pdf_annot annot, pdf_page *dest,
     return PDF_OK;
 }
 
+/* Every dict-backed setter needs a materialised annotation. A GOTO link is
+ * deferred until h_annot_link_to_page() supplies the destination, so the
+ * cell legitimately holds no annotation before that call - and libharu's
+ * HPDF_MarkupAnnot_* / HPDF_TextAnnot_* helpers do not NULL-check their
+ * argument, they fault the process. */
+static int annot_ready(const haru_annot *a)
+{
+    return a->annot != NULL;
+}
+
 static pdf_status h_annot_set_color(pdf_annot annot, const pdf_color *c)
 {
     haru_annot *a = (haru_annot *)((pdf_annot)annot)->obj;
@@ -1240,7 +1343,7 @@ static pdf_status h_annot_set_color(pdf_annot annot, const pdf_color *c)
     pdf_color nc = normalize_color(c);
     HPDF_STATUS st;
 
-    if (!a->annot)
+    if (!annot_ready(a))
         return PDF_ERR_INVALID_PARAM;
 
     if (nc.kind == PDF_COLOR_CMYK)
@@ -1273,6 +1376,14 @@ static pdf_status h_annot_set_icon(pdf_annot annot, pdf_annot_icon icon)
 {
     haru_annot *a = (haru_annot *)((pdf_annot)annot)->obj;
     haru_doc *d = (haru_doc *)a->pdf;
+
+    /* /Name only exists on a text annotation. libharu's
+     * HPDF_TextAnnot_SetIcon does not check the subtype and reads
+     * type-specific state, so calling it on a markup or link annotation
+     * faults the process instead of returning an error. Decline. */
+    if (!annot_ready(a) || a->type != PDF_ANNOT_TEXT)
+        return PDF_ERR_BACKEND_UNSUPPORTED;
+
     return haru_rc(HPDF_TextAnnot_SetIcon(a->annot, map_icon(icon)), d)
                == PDF_OK
                ? PDF_OK
@@ -1283,6 +1394,9 @@ static pdf_status h_annot_set_opacity(pdf_annot annot, double alpha)
 {
     haru_annot *a = (haru_annot *)((pdf_annot)annot)->obj;
     haru_doc *d = (haru_doc *)a->pdf;
+
+    if (!annot_ready(a))
+        return PDF_ERR_INVALID_PARAM;
     return haru_rc(HPDF_MarkupAnnot_SetTransparency(a->annot,
                                                     (HPDF_REAL)alpha),
                    d)
@@ -1295,6 +1409,9 @@ static pdf_status h_annot_set_author(pdf_annot annot, const char *author)
 {
     haru_annot *a = (haru_annot *)((pdf_annot)annot)->obj;
     haru_doc *d = (haru_doc *)a->pdf;
+
+    if (!annot_ready(a))
+        return PDF_ERR_INVALID_PARAM;
     return haru_rc(HPDF_MarkupAnnot_SetTitle(a->annot, author ? author : ""), d)
                == PDF_OK
                ? PDF_OK
@@ -1305,6 +1422,9 @@ static pdf_status h_annot_set_subject(pdf_annot annot, const char *subject)
 {
     haru_annot *a = (haru_annot *)((pdf_annot)annot)->obj;
     haru_doc *d = (haru_doc *)a->pdf;
+
+    if (!annot_ready(a))
+        return PDF_ERR_INVALID_PARAM;
     return haru_rc(HPDF_MarkupAnnot_SetSubject(a->annot,
                                                subject ? subject : ""),
                    d)
@@ -1317,6 +1437,11 @@ static pdf_status h_annot_set_open(pdf_annot annot, int opened)
 {
     haru_annot *a = (haru_annot *)((pdf_annot)annot)->obj;
     haru_doc *d = (haru_doc *)a->pdf;
+
+    /* Same reasoning as h_annot_set_icon: /Open is a text annotation key. */
+    if (!annot_ready(a) || a->type != PDF_ANNOT_TEXT)
+        return PDF_ERR_BACKEND_UNSUPPORTED;
+
     return haru_rc(HPDF_TextAnnot_SetOpened(a->annot, opened ? HPDF_TRUE
                                                              : HPDF_FALSE),
                    d)
@@ -1345,7 +1470,7 @@ static pdf_status h_outline_add(pdf_backend_doc *doc, pdf_outline parent,
     outline = HPDF_CreateOutline(d->pdf, parent_outline,
                                  title ? title : "", NULL);
     if (!outline)
-        return PDF_ERR_BACKEND_FAILED;
+        return haru_fail(d, "HPDF_CreateOutline");
 
     if (dest_page)
     {

@@ -1,0 +1,22 @@
+# Host + build profile: 32-bit (x86), STATIC CRT (/MT), no XP targeting.
+#
+# This is the plain 32-bit sibling of win-x64-static-release: same
+# toolchain generation (VS2017 / v141, compiler.version=191), same
+# /MT runtime, but arch=x86 and no XP toolset - the DLL produced from it
+# is a normal modern 32-bit image that runs on Windows 7+.
+#
+# Use for BOTH host and build profile:  -pr:a profiles/win-x86-static-release
+#
+# generator=Ninja keeps conan's toolchain from force-setting
+# CMAKE_GENERATOR_PLATFORM (which Ninja rejects).
+[settings]
+arch=x86
+build_type=Release
+compiler=msvc
+compiler.cppstd=14
+compiler.runtime=static
+compiler.version=191
+os=Windows
+
+[conf]
+tools.cmake.cmaketoolchain:generator=Ninja

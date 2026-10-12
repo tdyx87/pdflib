@@ -1,0 +1,97 @@
+; pdflib.def - authoritative export list for pdflib.dll.
+;
+; Names are exported verbatim (undecorated) on both x86 and x64, so
+; GetProcAddress / ctypes / JNA / P-Invoke / FFI all resolve them
+; identically. The list is the union of:
+;   - every PDFAPI function in pdflib/pdf_api.h (the engine core), and
+;   - the pdf_dll_* helpers in src/pdflib_export.c.
+;
+; LIBRARY must match the DLL output name exactly, otherwise link.exe
+; emits LNK4070 and can emit the wrong file name.
+LIBRARY pdflib
+
+EXPORTS
+    pdf_annot_create
+    pdf_annot_free
+    pdf_annot_link_to_page
+    pdf_annot_set_author
+    pdf_annot_set_color
+    pdf_annot_set_icon
+    pdf_annot_set_opacity
+    pdf_annot_set_open
+    pdf_annot_set_subject
+    pdf_dll_backends
+    pdf_dll_has_backend
+    pdf_dll_status_string
+    pdf_dll_version
+    pdf_doc_create
+    pdf_doc_create_streamed
+    pdf_doc_create_streamed_to_file
+    pdf_doc_create_streamed_to_handle
+    pdf_doc_finish
+    pdf_doc_free
+    pdf_doc_get_info
+    pdf_doc_page_count
+    pdf_doc_save_to_file
+    pdf_doc_save_to_handle
+    pdf_doc_save_to_memory
+    pdf_doc_save_to_stream
+    pdf_doc_set_compression
+    pdf_doc_set_encryption
+    pdf_doc_set_info
+    pdf_doc_set_page_mode_use_outlines
+    pdf_font_ascent
+    pdf_font_descent
+    pdf_font_find_system
+    pdf_font_free
+    pdf_font_get_std
+    pdf_font_load_ttf
+    pdf_font_load_ttf_memory
+    pdf_font_text_width
+    pdf_gstate_restore
+    pdf_gstate_save
+    pdf_image_free
+    pdf_image_get_size
+    pdf_image_load_file
+    pdf_image_load_memory
+    pdf_outline_add
+    pdf_outline_free
+    pdf_outline_set_open
+    pdf_page_add
+    pdf_page_add_custom
+    pdf_page_draw_image
+    pdf_page_draw_line
+    pdf_page_draw_rect
+    pdf_page_draw_text
+    pdf_page_draw_text_aligned
+    pdf_page_draw_text_wrapped
+    pdf_page_get_size
+    pdf_page_set_rotation
+    pdf_path_arc
+    pdf_path_circle
+    pdf_path_close
+    pdf_path_curve_to
+    pdf_path_discard
+    pdf_path_ellipse
+    pdf_path_line_to
+    pdf_path_move_to
+    pdf_path_paint
+    pdf_path_polygon
+    pdf_path_rectangle
+    pdf_set_blend_mode
+    pdf_set_fill_color
+    pdf_set_line_cap
+    pdf_set_line_dash
+    pdf_set_line_join
+    pdf_set_line_width
+    pdf_set_miter_limit
+    pdf_set_opacity
+    pdf_set_stroke_color
+    pdf_set_text_render_mode
+    pdf_set_transform
+    pdflib_backend_version
+    pdflib_get_backend
+    pdflib_has_backend
+    pdflib_last_error
+    pdflib_set_backend
+    pdflib_version

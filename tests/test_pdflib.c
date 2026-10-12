@@ -9,6 +9,52 @@
  * It links no third-party library, so it always builds (core-only CI).
  */
 
+/* --- minimal OS-handle shim ------------------------------------------
+ * pdflib takes OS handles rather than FILE* wherever an "already open"
+ * target is involved: the DLL links the CRT statically, so a FILE* opened
+ * here belongs to this program's CRT and the DLL's stdio rejects it as an
+ * invalid parameter (which aborts the process outright). An OS handle is
+ * process-wide and means the same thing on both sides. */
+#ifdef _WIN32
+#include <windows.h>
+static void *test_open_write(const char *path)
+{
+    HANDLE h = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, NULL);
+    return (h == INVALID_HANDLE_VALUE) ? NULL : (void *)h;
+}
+static void *test_open_read(const char *path)
+{
+    HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    return (h == INVALID_HANDLE_VALUE) ? NULL : (void *)h;
+}
+static void test_close(void *h)
+{
+    if (h)
+        CloseHandle((HANDLE)h);
+}
+#else
+#include <fcntl.h>
+#include <stdint.h>
+#include <unistd.h>
+static void *test_open_write(const char *path)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    return (fd < 0) ? NULL : (void *)(intptr_t)fd;
+}
+static void *test_open_read(const char *path)
+{
+    int fd = open(path, O_RDONLY);
+    return (fd < 0) ? NULL : (void *)(intptr_t)fd;
+}
+static void test_close(void *h)
+{
+    if (h)
+        close((int)(intptr_t)h);
+}
+#endif
+
 #define CHECK(cond)                                                    \
     do                                                                 \
     {                                                                  \
@@ -171,23 +217,26 @@ static void test_stream_output(void)
     /* invalid params */
     CHECK(pdf_doc_save_to_stream(doc, NULL, &sink) == PDF_ERR_INVALID_PARAM);
 
-    /* save_to_FILE round trip through a real file */
+    /* save_to_handle round trip through a real file */
     {
-        FILE *f = fopen("test-stream-out.pdf", "wb");
-        CHECK(f != NULL);
-        if (f)
+        void *h = test_open_write("test-stream-out.pdf");
+        CHECK(h != NULL);
+        if (h)
         {
-            CHECK(pdf_doc_save_to_FILE(doc, f) == PDF_OK);
-            fclose(f);
-            f = fopen("test-stream-out.pdf", "rb");
-            CHECK(f != NULL);
-            if (f)
+            CHECK(pdf_doc_save_to_handle(doc, h) == PDF_OK);
+            test_close(h);
+
             {
-                unsigned char head[5] = {0};
-                CHECK(fread(head, 1, 5, f) == 5);
-                CHECK(memcmp(head, "%PDF-", 5) == 0);
-                fclose(f);
-                remove("test-stream-out.pdf");
+                FILE *f = fopen("test-stream-out.pdf", "rb");
+                CHECK(f != NULL);
+                if (f)
+                {
+                    unsigned char head[5] = {0};
+                    CHECK(fread(head, 1, 5, f) == 5);
+                    CHECK(memcmp(head, "%PDF-", 5) == 0);
+                    fclose(f);
+                    remove("test-stream-out.pdf");
+                }
             }
         }
     }
@@ -247,32 +296,28 @@ static void test_streamed_abort(void)
     pdf_doc_free(doc); /* teardown must not push either */
     CHECK(sink.calls == 2);
 
-    /* 2) an owned sink FILE that hard-fails on write aborts mid-stream.
-     *    core owns the FILE handle: after the abort it is closed, and
-     *    create_streamed_to_file would have unlinked its target - we
-     *    verify the ownership contract with a read-only FILE (writes
-     *    fail with EBADF, producing a genuine I/O error at page 1). */
+    /* 2) a caller-owned sink handle that hard-fails on write aborts
+     *    mid-stream. The handle stays the caller's - pdflib must never
+     *    close it - and the failure has to surface as a status code, not
+     *    as a crash. A read-only handle gives a genuine I/O error on the
+     *    very first page. */
     {
-        FILE *ro;
+        void *ro;
         FILE *w = fopen("ro-probe.bin", "wb");
         CHECK(w != NULL);
-        fclose(w);
-        ro = fopen("ro-probe.bin", "rb");
+        if (w)
+            fclose(w);
+        ro = test_open_read("ro-probe.bin");
         CHECK(ro != NULL);
-        remove("ro-probe.bin"); /* only the read handle below keeps it alive */
-        CHECK(pdf_doc_create_streamed_to_FILE(ro, &doc) == PDF_OK);
+        CHECK(pdf_doc_create_streamed_to_handle(ro, &doc) == PDF_OK);
         CHECK(pdf_page_add(doc, PDF_PAGE_A4, PDF_ORIENTATION_PORTRAIT, &page)
-              == PDF_ERR_IO); /* fwrite to read-only handle fails */
+              == PDF_ERR_IO); /* write to a read-only handle fails */
         CHECK(pdf_page_add(doc, PDF_PAGE_A4, PDF_ORIENTATION_PORTRAIT, &page)
               == PDF_ERR_IO); /* broken: fast fail, no further deliveries */
         CHECK(pdf_doc_finish(doc) == PDF_ERR_IO);
-        pdf_doc_free(doc); /* closes the read-only handle we opened */
-        {
-            FILE *f = fopen("ro-probe.bin", "rb");
-            CHECK(f != NULL); /* handle was closed exactly once by free */
-            fclose(f);
-            remove("ro-probe.bin");
-        }
+        pdf_doc_free(doc);
+        test_close(ro); /* still ours to close */
+        remove("ro-probe.bin");
     }
 
     /* 3) healthy path still works after the abort tests (fresh doc) */

@@ -39,6 +39,7 @@
 #include <new>
 #include <stdexcept>
 #include <string>
+#include <string>
 
 /* 0.9.x typedefs live in the PoDoFo namespace after including the header. */
 using PoDoFo::pdf_long;
@@ -195,6 +196,38 @@ struct podofo_doc
     std::unique_ptr<PoDoFo::PdfPainter> painter;
     PoDoFo::PdfPage *painted_page = nullptr;
 
+    /* Subset fonts built from a MEMORY buffer, via PdfFontFactory.
+     *
+     * PoDoFo embeds pending subset fonts by walking the document's font
+     * CACHE (PdfDocument::Write -> PdfFontCache::EmbedSubsetFonts), and a
+     * font built by the factory is not in that cache. Without this list
+     * the font is created, given a /FontDescriptor with correct metrics,
+     * referenced from the page - and then never embedded, so no /FontFile2
+     * is written and the 2-byte identity codes in the content stream match
+     * no glyphs. The text comes out as unrelated characters.
+     *
+     * Fonts loaded from a file go through PdfDocument::CreateFontSubset,
+     * which registers in the cache and is embedded normally; only the
+     * memory path needs this. */
+    std::vector<PoDoFo::PdfFont *> extra_subset_fonts;
+
+    /* Text rendering mode. PdfPainter cannot express this correctly, so
+     * the adapter does not use its bookkeeping at all - see
+     * p_set_text_render_mode for the two upstream defects. Instead it
+     * keeps the mode itself and writes the "<n> Tr" operator straight
+     * into the page's content stream, just before the text object that
+     * needs it. The painter's own mode is therefore never touched and
+     * stays at Fill for the whole document, so it never emits a
+     * conflicting operator of its own.
+     *
+     *   tr_wanted     the mode the caller last asked for
+     *   tr_in_stream  the mode the page's content stream carries
+     *   tr_stack      tr_in_stream, pushed on q and popped on Q, because
+     *                 /Tr is text state and Q restores it. */
+    pdf_text_render_mode tr_wanted = PDF_TEXT_RENDER_FILL;
+    pdf_text_render_mode tr_in_stream = PDF_TEXT_RENDER_FILL;
+    std::vector<pdf_text_render_mode> tr_stack;
+
     /* PdfDocument interface shared by both modes. */
     PoDoFo::PdfDocument *pdoc() const
     {
@@ -245,6 +278,22 @@ static pdf_status pf_catch(podofo_doc *d, const std::exception &e,
     return PDF_ERR_BACKEND_FAILED;
 }
 
+/* Last-resort handler. PoDoFo throws types that are NOT derived from
+ * std::exception (observed for TrueType-Collection subset embedding), and
+ * `catch (const std::exception &)` silently lets those through. If that
+ * happens it unwinds straight across the C ABI and terminates whatever
+ * process loaded us - unacceptable for a DLL meant to be called from any
+ * language, so every entry point also has this net below. The `d` argument
+ * mirrors the one the std::exception handler uses so the per-document
+ * message still gets updated. */
+static pdf_status pf_foreign(podofo_doc *d)
+{
+    if (d)
+        d->last_error =
+            "podofo raised an exception outside the std::exception hierarchy";
+    return PDF_ERR_BACKEND_FAILED;
+}
+
 static PoDoFo::PdfColor to_color(const pdf_color *c)
 {
     switch (c->kind)
@@ -290,12 +339,21 @@ static pdf_status paint_on(podofo_doc *d, PoDoFo::PdfPage *page)
             flush_painter(d);
             d->painter->SetPage(page);
             d->painted_page = page;
+            /* A fresh content stream starts at the PDF default, which is
+             * Fill for /Tr. */
+            d->tr_wanted = PDF_TEXT_RENDER_FILL;
+            d->tr_in_stream = PDF_TEXT_RENDER_FILL;
+            d->tr_stack.clear();
         }
         return PDF_OK;
     }
     catch (const std::exception &e)
     {
         return pf_catch(d, e, "SetPage");
+    }
+    catch (...)
+    {
+        return pf_foreign(d);
     }
 }
 
@@ -308,6 +366,57 @@ static PoDoFo::PdfPage *page_of(pdf_page p)
     return o->owner->pdoc()->GetPage(o->page_index);
 }
 
+/* Append a raw operator to the page's content stream.
+ *
+ * The painter appends its own output to this same stream as it goes, so
+ * an operator written here lands exactly where it is needed in the
+ * sequence. The stream is already in append mode: PdfPainter::SetPage()
+ * calls BeginAppend() and FinishPage() calls EndAppend(), and paint_on()
+ * guarantees the painter is attached.
+ *
+ * Only valid while the page's /Contents is a single stream, which is what
+ * CreatePage() produces. (For a /Contents ARRAY, GetContentsForAppending
+ * would create a *new* stream on each call and the ordering would be
+ * wrong - but pdflib only ever writes documents it created, and never
+ * appends a second content stream to a page, so this cannot arise.) */
+static pdf_status append_raw_op(PoDoFo::PdfPage *page, const char *op)
+{
+    PoDoFo::PdfObject *contents = page->GetContentsForAppending();
+    PoDoFo::PdfStream *stream;
+
+    if (!contents)
+        return PDF_ERR_BACKEND_FAILED;
+    stream = contents->GetStream();
+    if (!stream)
+        return PDF_ERR_BACKEND_FAILED;
+    stream->Append(op);
+    return PDF_OK;
+}
+
+/* Make the page's content stream carry the mode the caller asked for.
+ *
+ * Called immediately before each text object, so the operator precedes
+ * the text it applies to. Nothing is written when the stream already
+ * carries the right mode, which keeps the output as small as libharu's. */
+static pdf_status apply_text_render_mode(podofo_doc *d, PoDoFo::PdfPage *page)
+{
+    static const char *const ops[] = { "0 Tr\n", "1 Tr\n", "2 Tr\n", "3 Tr\n" };
+    int m = (int)d->tr_wanted;
+
+    if (d->tr_in_stream == d->tr_wanted)
+        return PDF_OK;
+    if (m < 0 || m > 3)
+        m = 0;
+    {
+        pdf_status st = append_raw_op(page, ops[m]);
+        if (st != PDF_OK)
+            return st;
+    }
+    d->tr_in_stream = d->tr_wanted;
+    return PDF_OK;
+}
+
+
 /* Every podofo_obj carries a back pointer to the podofo_doc that
  * created it, so page/annot/outline calls do not depend on per-thread
  * state: the same handle may be used from another thread as long as the
@@ -317,6 +426,50 @@ static podofo_doc *doc_of_obj(podofo_obj *o)
 {
     return o ? o->owner : nullptr;
 }
+
+/* Guard used by the accessor entry points below. These are the functions
+ * the original code left completely bare: a bad handle or an out-parameter
+ * the caller forgot to allocate dereferences memory directly, and a fault
+ * inside PoDoFo unwinds straight into the host instead of surfacing as a
+ * status code. Keeping the guard a macro makes it identical everywhere
+ * rather than a thing every future contributor has to remember.
+ *
+ *   PF_CHECK_OBJ(handle, kind)
+ *       declares `cell_` and validates a non-NULL wrapper of the
+ *       expected kind; returns PDF_ERR_INVALID_HANDLE otherwise.
+ */
+/* Guard used by the accessor entry points below. These are the functions
+ * the original code left completely bare: a bad handle or an out-parameter
+ * the caller forgot to allocate dereferences memory directly, and a fault
+ * inside PoDoFo unwinds straight into the host instead of surfacing as a
+ * status code. Keeping the guard a macro makes it identical everywhere
+ * rather than a thing every future contributor has to remember.
+ *
+ *   PF_CHECK_OBJ(handle, wantkind)
+ *       declares `cell_` and validates a non-NULL core wrapper of the
+ *       expected kind; returns PDF_ERR_INVALID_HANDLE otherwise.
+ *
+ * `handle` is one of the core's opaque pdf_*_cell pointers, whose `obj`
+ * member holds this backend's podofo_obj.
+ */
+#define PF_CHECK_OBJ(handle, wantkind)                                        \
+    podofo_obj *cell_ = ((handle) ? O(((handle)->obj)) : NULL);                \
+    do {                                                                      \
+        if (!(handle) || !cell_ || cell_->kind != (wantkind))                 \
+            return PDF_ERR_INVALID_HANDLE;                                    \
+    } while (0)
+
+/* Convert a PoDoFo exception - or a hardware fault, since this TU is built
+ * with /EHa - into a status code on an accessor entry point. */
+#define PF_ACCESSOR_TAIL(docvar, what)                                          \
+    catch (const std::exception &e)                                              \
+    {                                                                            \
+        return pf_catch(docvar, e, what);                                        \
+    }                                                                            \
+    catch (...)                                                                  \
+    {                                                                            \
+        return pf_foreign(docvar);                                               \
+    }
 
 static podofo_doc *doc_of_page(pdf_page p)
 {
@@ -357,6 +510,30 @@ static pdf_status p_doc_create(pdf_backend_doc **out_doc)
         delete d;
         (void)pf_catch(nullptr, e, "PdfMemDocument");
         return PDF_ERR_BACKEND_FAILED;
+    }
+}
+
+/* Embed the subset fonts that PoDoFo will not embed by itself.
+ *
+ * Must run after every glyph has been drawn and before the document is
+ * serialised: EmbedSubsetFont() is what turns the recorded glyph set into
+ * a /FontFile2. Safe to call more than once (PoDoFo tracks whether a font
+ * has already been embedded), and a failure here must not abort a save -
+ * the document is still readable, just without that font program. */
+static void embed_extra_subset_fonts(podofo_doc *d)
+{
+    for (size_t i = 0; i < d->extra_subset_fonts.size(); i++)
+    {
+        try
+        {
+            PoDoFo::PdfFont *f = d->extra_subset_fonts[i];
+            if (f && f->IsSubsetting())
+                f->EmbedSubsetFont();
+        }
+        catch (...)
+        {
+            /* leave it un-embedded rather than fail the whole save */
+        }
     }
 }
 
@@ -402,6 +579,9 @@ static pdf_status p_doc_finish(pdf_backend_doc *doc)
             if (src != PDF_OK)
                 return src; /* sink already failed; do not push more */
         }
+        /* The cache-driven pass inside Close() only covers file-loaded
+         * fonts; memory-loaded ones have to be embedded first. */
+        embed_extra_subset_fonts(d);
         /* embeds pending subsets and completes xref/trailer */
         d->sdoc->Close();
         if (d->device)
@@ -416,6 +596,10 @@ static pdf_status p_doc_finish(pdf_backend_doc *doc)
     catch (const std::exception &e)
     {
         return pf_catch(d, e, "Close(streamed)");
+    }
+    catch (...)
+    {
+        return pf_foreign(d);
     }
 }
 
@@ -441,12 +625,17 @@ static pdf_status p_doc_save_to_file(pdf_backend_doc *doc, const char *path)
     try
     {
         flush_painter(d);
+        embed_extra_subset_fonts(d);
         d->doc->Write(path); /* memory-mode only; streamed rejects save */
         return PDF_OK;
     }
     catch (const std::exception &e)
     {
         return pf_catch(d, e, "Write");
+    }
+    catch (...)
+    {
+        return pf_foreign(d);
     }
 }
 
@@ -458,6 +647,7 @@ static pdf_status p_doc_save_to_memory(pdf_backend_doc *doc,
     try
     {
         flush_painter(d);
+        embed_extra_subset_fonts(d);
         PoDoFo::PdfWriter writer(&d->doc->GetObjects(),
                                  d->doc->GetTrailer());
         writer.SetPdfVersion(d->doc->GetPdfVersion());
@@ -482,6 +672,10 @@ static pdf_status p_doc_save_to_memory(pdf_backend_doc *doc,
     catch (const std::exception &e)
     {
         return pf_catch(d, e, "WriteToBuffer");
+    }
+    catch (...)
+    {
+        return pf_foreign(d);
     }
 }
 
@@ -518,6 +712,10 @@ static pdf_status p_doc_set_info(pdf_backend_doc *doc, pdf_info_key key,
     {
         return pf_catch(d, e, "SetInfo");
     }
+    catch (...)
+    {
+        return pf_foreign(d);
+    }
 }
 
 static pdf_status p_doc_get_info(pdf_backend_doc *doc, pdf_info_key key,
@@ -547,6 +745,10 @@ static pdf_status p_doc_get_info(pdf_backend_doc *doc, pdf_info_key key,
     catch (const std::exception &e)
     {
         return pf_catch(d, e, "GetInfo");
+    }
+    catch (...)
+    {
+        return pf_foreign(d);
     }
 
     size_t len = value.size() + 1;
@@ -621,6 +823,10 @@ static pdf_status p_doc_set_encryption(pdf_backend_doc *doc,
     {
         return pf_catch(d, e, "SetEncrypted");
     }
+    catch (...)
+    {
+        return pf_foreign(d);
+    }
 #else
     /* PoDoFo built without libcrypto: no encryption support at all. */
     (void)doc; (void)mode; (void)owner; (void)user; (void)permissions;
@@ -647,6 +853,10 @@ static pdf_status p_doc_set_compression(pdf_backend_doc *doc, unsigned mask)
     {
         return pf_catch(d, e, "SetWriteMode");
     }
+    catch (...)
+    {
+        return pf_foreign(d);
+    }
 }
 
 static pdf_status p_doc_set_page_mode_use_outlines(pdf_backend_doc *doc,
@@ -662,6 +872,10 @@ static pdf_status p_doc_set_page_mode_use_outlines(pdf_backend_doc *doc,
     catch (const std::exception &e)
     {
         return pf_catch(d, e, "SetPageMode");
+    }
+    catch (...)
+    {
+        return pf_foreign(d);
     }
 }
 
@@ -713,21 +927,40 @@ static pdf_status p_page_add(pdf_backend_doc *doc, double w, double h,
     {
         return pf_catch(d, e, "CreatePage");
     }
+    catch (...)
+    {
+        return pf_foreign(d);
+    }
 }
 
 static pdf_status p_page_count(pdf_backend_doc *doc, size_t *out_count)
 {
     podofo_doc *d = D(doc);
-    *out_count = (size_t)d->pdoc()->GetPageCount();
-    return PDF_OK;
+    if (!out_count)
+        return PDF_ERR_INVALID_PARAM;
+    if (!doc)
+        return PDF_ERR_INVALID_HANDLE;
+    try
+    {
+        *out_count = (size_t)d->pdoc()->GetPageCount();
+        return PDF_OK;
+    }
+    PF_ACCESSOR_TAIL(d, "PageCount");
 }
 
 static pdf_status p_page_get_size(pdf_page page, double *out_w, double *out_h)
 {
-    PoDoFo::PdfRect r = page_of(page)->GetPageSize();
-    *out_w = r.GetWidth();
-    *out_h = r.GetHeight();
-    return PDF_OK;
+    if (!out_w || !out_h)
+        return PDF_ERR_INVALID_PARAM;
+    PF_CHECK_OBJ(page, PFOBJ_PAGE);
+    try
+    {
+        PoDoFo::PdfRect r = page_of(page)->GetPageSize();
+        *out_w = r.GetWidth();
+        *out_h = r.GetHeight();
+        return PDF_OK;
+    }
+    PF_ACCESSOR_TAIL(doc_of_obj(cell_), "PageSize");
 }
 
 static pdf_status p_page_set_rotation(pdf_page page, int degrees)
@@ -741,6 +974,10 @@ static pdf_status p_page_set_rotation(pdf_page page, int degrees)
     catch (const std::exception &e)
     {
         return pf_catch(d, e, "SetRotation");
+    }
+    catch (...)
+    {
+        return pf_foreign(d);
     }
 }
 
@@ -820,6 +1057,45 @@ static pdf_status p_font_get_std(pdf_backend_doc *doc, pdf_std_font font,
     {
         return pf_catch(d, e, "CreateFont");
     }
+    catch (...)
+    {
+        return pf_foreign(d);
+    }
+}
+
+/* The name PoDoFo should register a font file under.
+ *
+ * This is not cosmetic. PoDoFo's font cache is keyed on the font NAME, and
+ * CreateFontSubset() registers the new font under the name it is given, so
+ * calling it twice with the same name hands back the FIRST font instead of
+ * creating a second one. Passing "" - which the API documents as "take the
+ * name from the file" - therefore makes every subset font after the first
+ * alias the first one: the second font's text is drawn with the first
+ * font's glyphs (so it comes out as blanks whenever the two do not share
+ * the characters) and only the first font is ever written into the PDF.
+ *
+ * That is not hypothetical. It is exactly why a document with an embedded
+ * Latin face plus an embedded CJK face silently lost all of the CJK text:
+ * pdf_font_load_ttf() reported PDF_OK for both, and the CJK ran off the
+ * Latin font.
+ *
+ * The file's base name is both unique and semantically right: two loads of
+ * the same file SHOULD share one font object. */
+static std::string pdflib_font_key(const char *path)
+{
+    std::string s(path ? path : "");
+    size_t slash = s.find_last_of("/\\");
+
+    if (slash != std::string::npos)
+        s = s.substr(slash + 1);
+    {
+        size_t dot = s.find_last_of('.');
+        if (dot != std::string::npos && dot > 0)
+            s = s.substr(0, dot);
+    }
+    if (s.empty())
+        s = "pdflib-ttf";
+    return s;
 }
 
 static pdf_status p_font_load_ttf(pdf_backend_doc *doc, const char *path,
@@ -835,6 +1111,7 @@ static pdf_status p_font_load_ttf(pdf_backend_doc *doc, const char *path,
                 return src;
         }
         PoDoFo::PdfFont *f;
+        std::string key = pdflib_font_key(path);
         if (embed)
         {
             /* Subset embedding: glyphs are collected as pages are drawn
@@ -844,7 +1121,7 @@ static pdf_status p_font_load_ttf(pdf_backend_doc *doc, const char *path,
              * character set is unknown up front. Works with identity
              * (2-byte) encoding so arbitrary unicode can be drawn. */
             f = d->pdoc()->CreateFontSubset(
-                "", false, false, false,
+                key.c_str(), false, false, false,
                 PoDoFo::PdfEncodingFactory::GlobalIdentityEncodingInstance(),
                 path);
         }
@@ -852,9 +1129,9 @@ static pdf_status p_font_load_ttf(pdf_backend_doc *doc, const char *path,
         {
             /* Reference the font without embedding; the overload taking a
              * file name is CreateFont(name, bold, italic, ...,
-             * pszFileName); the name is taken from the file itself. */
+             * pszFileName). */
             f = d->pdoc()->CreateFont(
-                "", false, false, false,
+                key.c_str(), false, false, false,
                 PoDoFo::PdfEncodingFactory::GlobalWinAnsiEncodingInstance(),
                 PoDoFo::PdfFontCache::eFontCreationFlags_None,
                 false, path);
@@ -866,6 +1143,10 @@ static pdf_status p_font_load_ttf(pdf_backend_doc *doc, const char *path,
     catch (const std::exception &e)
     {
         return pf_catch(d, e, "CreateFont(file)");
+    }
+    catch (...)
+    {
+        return pf_foreign(d);
     }
 }
 
@@ -886,28 +1167,55 @@ static pdf_status p_font_load_ttf_memory(pdf_backend_doc *doc,
         /* Build metrics from the memory buffer, then let the factory
          * create the font object inside the document. GetFontLibrary()
          * returns the handle by value; the metrics constructor wants its
-         * address, so keep it in a local. */
+         * address, so keep it in a local.
+         *
+         * The metrics object MUST be heap-allocated: CreateFontObject()
+         * takes ownership and deletes it - together with the font on
+         * success, and by itself on failure (see PdfFontFactory.h). Giving
+         * it the address of a stack local would make PoDoFo call delete on
+         * stack memory, which corrupts the heap and makes the first
+         * DrawText() with this font fail.
+         *
+         * The buffer overload copies the caller's bytes, so the caller may
+         * free its buffer as soon as this function returns. */
         FT_Library ft = d->pdoc()->GetFontLibrary();
-        PoDoFo::PdfFontMetricsFreetype metrics(
-            &ft, (const char *)data, (unsigned int)size, false);
+        PoDoFo::PdfFontMetricsFreetype *metrics =
+            new PoDoFo::PdfFontMetricsFreetype(
+                &ft, (const char *)data, (unsigned int)size, false);
         /* Subsetting via the same CID path as file fonts: glyphs are
          * registered while pages are drawn and the subset is built at
-         * finish. Identity encoding keeps 2-byte unicode intact. */
-        int flags = PoDoFo::ePdfFont_Subsetting;
+         * finish. Identity encoding keeps 2-byte unicode intact.
+         *
+         * ePdfFont_Subsetting does NOT imply ePdfFont_Embedded - they are
+         * separate bits (0x08 and 0x01). Asking for subsetting alone
+         * produced a font with no /FontDescriptor and no /FontFile2, i.e.
+         * a font that was never written into the document at all, and
+         * whose 2-byte codes no reader could map: the text came out as
+         * unrelated glyphs (drawn "Memory ABC 123", extracted
+         * "-... !\"# ..."). Both bits are required. */
+        int flags = PoDoFo::ePdfFont_Embedded | PoDoFo::ePdfFont_Subsetting;
         if (!embed)
             flags = PoDoFo::ePdfFont_Normal;
         PoDoFo::PdfFont *f = PoDoFo::PdfFontFactory::CreateFontObject(
-            &metrics, flags,
+            metrics, flags,
             embed ? PoDoFo::PdfEncodingFactory::GlobalIdentityEncodingInstance()
                   : PoDoFo::PdfEncodingFactory::GlobalWinAnsiEncodingInstance(),
             d->pdoc()->GetObjects());
         if (!f)
             return PDF_ERR_BACKEND_FAILED;
+        /* Not in the document's font cache, so PoDoFo's own embedding pass
+         * will never see it. Remember it and embed it at save time. */
+        if (f->IsSubsetting())
+            d->extra_subset_fonts.push_back(f);
         return make_font_cell(d, f, out_font);
     }
     catch (const std::exception &e)
     {
         return pf_catch(d, e, "CreateFont(mem)");
+    }
+    catch (...)
+    {
+        return pf_foreign(d);
     }
 }
 
@@ -933,6 +1241,10 @@ static pdf_status p_font_find_system(pdf_backend_doc *doc, const char *family,
     {
         return pf_catch(d, e, "CreateFont(system)");
     }
+    catch (...)
+    {
+        return pf_foreign(d);
+    }
 }
 
 static void p_font_free(pdf_font font)
@@ -944,36 +1256,66 @@ static void p_font_free(pdf_font font)
 static pdf_status p_font_text_width(pdf_font font, const char *text,
                                     double size, double *out_width)
 {
-    PoDoFo::PdfFont *f = O(((pdf_font)font)->obj)->font;
-    /* CharWidth returns the width already scaled by the metrics' current
-     * size, so set the size first and measure. We save/restore around it
-     * because the painter sets the size explicitly before drawing. */
-    float saved = f->GetFontSize();
-    f->SetFontSize((float)size);
-    const PoDoFo::PdfFontMetrics *m = f->GetFontMetrics();
-    double w = 0.0;
-    for (const char *p = text; p && *p; ++p)
-        w += m->CharWidth((unsigned char)*p);
-    f->SetFontSize(saved);
-    *out_width = w;
-    return PDF_OK;
+    if (!out_width)
+        return PDF_ERR_INVALID_PARAM;
+    PF_CHECK_OBJ(font, PFOBJ_FONT);
+    if (!text)
+        return PDF_ERR_INVALID_PARAM;
+    try
+    {
+        PoDoFo::PdfFont *f = cell_->font;
+        if (!f)
+            return PDF_ERR_INVALID_HANDLE;
+        /* CharWidth returns the width already scaled by the metrics'
+         * current size, so set the size first and measure. We
+         * save/restore around it because the painter sets the size
+         * explicitly before drawing. */
+        float saved = f->GetFontSize();
+        f->SetFontSize((float)size);
+        const PoDoFo::PdfFontMetrics *m = f->GetFontMetrics();
+        double w = 0.0;
+        for (const char *p = text; *p; ++p)
+            w += m->CharWidth((unsigned char)*p);
+        f->SetFontSize(saved);
+        *out_width = w;
+        return PDF_OK;
+    }
+    PF_ACCESSOR_TAIL(doc_of_obj(cell_), "TextWidth");
 }
 
 static pdf_status p_font_ascent(pdf_font font, double size, double *out)
 {
-    PoDoFo::PdfFont *f = O(((pdf_font)font)->obj)->font;
-    const PoDoFo::PdfFontMetrics *m = f->GetFontMetrics();
-    /* GetPdfAscent is in font units (1000 upm); scale to points. */
-    *out = m->GetPdfAscent() * size / 1000.0;
-    return PDF_OK;
+    if (!out)
+        return PDF_ERR_INVALID_PARAM;
+    PF_CHECK_OBJ(font, PFOBJ_FONT);
+    try
+    {
+        PoDoFo::PdfFont *f = cell_->font;
+        if (!f)
+            return PDF_ERR_INVALID_HANDLE;
+        const PoDoFo::PdfFontMetrics *m = f->GetFontMetrics();
+        /* GetPdfAscent is in font units (1000 upm); scale to points. */
+        *out = m->GetPdfAscent() * size / 1000.0;
+        return PDF_OK;
+    }
+    PF_ACCESSOR_TAIL(doc_of_obj(cell_), "Ascent");
 }
 
 static pdf_status p_font_descent(pdf_font font, double size, double *out)
 {
-    PoDoFo::PdfFont *f = O(((pdf_font)font)->obj)->font;
-    const PoDoFo::PdfFontMetrics *m = f->GetFontMetrics();
-    *out = m->GetPdfDescent() * size / 1000.0;
-    return PDF_OK;
+    if (!out)
+        return PDF_ERR_INVALID_PARAM;
+    PF_CHECK_OBJ(font, PFOBJ_FONT);
+    try
+    {
+        PoDoFo::PdfFont *f = cell_->font;
+        if (!f)
+            return PDF_ERR_INVALID_HANDLE;
+        const PoDoFo::PdfFontMetrics *m = f->GetFontMetrics();
+        *out = m->GetPdfDescent() * size / 1000.0;
+        return PDF_OK;
+    }
+    PF_ACCESSOR_TAIL(doc_of_obj(cell_), "Descent");
 }
 
 /* ----- text ------------------------------------------------------------------------ */
@@ -991,6 +1333,12 @@ static pdf_status p_draw_text(pdf_page page, pdf_font font,
             return st;
         f->SetFontSize((float)size);
         d->painter->SetFont(f);
+        /* The render-mode operator has to be in the stream before the
+         * text object it applies to; the painter emits none of its own,
+         * because its own mode is left at Fill for the whole document. */
+        st = apply_text_render_mode(d, page_of(page));
+        if (st != PDF_OK)
+            return st;
         /* The const char* ctor treats bytes as PDFDocEncoding; the utf8
    * overload converts to UTF-16BE and marks the string unicode,
    * which is what identity-encoded CID text and the subsetting
@@ -1004,6 +1352,10 @@ static pdf_status p_draw_text(pdf_page page, pdf_font font,
     catch (const std::exception &e)
     {
         return pf_catch(d, e, "DrawText");
+    }
+    catch (...)
+    {
+        return pf_foreign(d);
     }
 }
 
@@ -1021,6 +1373,9 @@ static pdf_status p_draw_text_aligned(pdf_page page, pdf_font font,
             return st;
         f->SetFontSize((float)size);
         d->painter->SetFont(f);
+        st = apply_text_render_mode(d, page_of(page));
+        if (st != PDF_OK)
+            return st;
         PoDoFo::EPdfAlignment a = PoDoFo::ePdfAlignment_Left;
         if (align == PDF_ALIGN_CENTER)
             a = PoDoFo::ePdfAlignment_Center;
@@ -1037,6 +1392,10 @@ static pdf_status p_draw_text_aligned(pdf_page page, pdf_font font,
     {
         return pf_catch(d, e, "DrawTextAligned");
     }
+    catch (...)
+    {
+        return pf_foreign(d);
+    }
 }
 
 /* ----- graphics state ------------------------------------------------------------------ */
@@ -1049,12 +1408,20 @@ static pdf_status p_gstate_save(pdf_page page)
         pdf_status st = paint_on(d, page_of(page));
         if (st != PDF_OK)
             return st;
+        /* /Tr is text state, so the q pushed here will restore it at the
+         * matching Q - even though PdfPainter's own variable survives
+         * both. Remember what the stream carried at this point. */
+        d->tr_stack.push_back(d->tr_in_stream);
         d->painter->Save();
         return PDF_OK;
     }
     catch (const std::exception &e)
     {
         return pf_catch(d, e, "Save");
+    }
+    catch (...)
+    {
+        return pf_foreign(d);
     }
 }
 
@@ -1067,11 +1434,24 @@ static pdf_status p_gstate_restore(pdf_page page)
         if (st != PDF_OK)
             return st;
         d->painter->Restore();
+        /* Q restored the stream's /Tr to whatever it was at the matching
+         * q. The adapter writes that operator itself, so all that is
+         * needed is to remember the restored value: the next text object
+         * re-emits it if it differs from what the caller wants. */
+        if (!d->tr_stack.empty())
+        {
+            d->tr_in_stream = d->tr_stack.back();
+            d->tr_stack.pop_back();
+        }
         return PDF_OK;
     }
     catch (const std::exception &e)
     {
         return pf_catch(d, e, "Restore");
+    }
+    catch (...)
+    {
+        return pf_foreign(d);
     }
 }
 
@@ -1091,6 +1471,10 @@ static pdf_status p_set_transform(pdf_page page, double a, double b,
     {
         return pf_catch(d, e, "SetTransformationMatrix");
     }
+    catch (...)
+    {
+        return pf_foreign(d);
+    }
 }
 
 static pdf_status p_set_line_width(pdf_page page, double w)
@@ -1107,6 +1491,10 @@ static pdf_status p_set_line_width(pdf_page page, double w)
     catch (const std::exception &e)
     {
         return pf_catch(d, e, "SetStrokeWidth");
+    }
+    catch (...)
+    {
+        return pf_foreign(d);
     }
 }
 
@@ -1136,6 +1524,10 @@ static pdf_status p_set_line_cap(pdf_page page, pdf_line_cap cap)
     {
         return pf_catch(d, e, "SetLineCapStyle");
     }
+    catch (...)
+    {
+        return pf_foreign(d);
+    }
 }
 
 static pdf_status p_set_line_join(pdf_page page, pdf_line_join join)
@@ -1164,6 +1556,10 @@ static pdf_status p_set_line_join(pdf_page page, pdf_line_join join)
     {
         return pf_catch(d, e, "SetLineJoinStyle");
     }
+    catch (...)
+    {
+        return pf_foreign(d);
+    }
 }
 
 static pdf_status p_set_miter_limit(pdf_page page, double limit)
@@ -1180,6 +1576,10 @@ static pdf_status p_set_miter_limit(pdf_page page, double limit)
     catch (const std::exception &e)
     {
         return pf_catch(d, e, "SetMiterLimit");
+    }
+    catch (...)
+    {
+        return pf_foreign(d);
     }
 }
 
@@ -1222,6 +1622,10 @@ static pdf_status p_set_line_dash(pdf_page page, const double *pattern,
     {
         return pf_catch(d, e, "SetStrokeStyle");
     }
+    catch (...)
+    {
+        return pf_foreign(d);
+    }
 }
 
 static pdf_status p_set_fill_color(pdf_page page, const pdf_color *c)
@@ -1239,6 +1643,10 @@ static pdf_status p_set_fill_color(pdf_page page, const pdf_color *c)
     {
         return pf_catch(d, e, "SetColor");
     }
+    catch (...)
+    {
+        return pf_foreign(d);
+    }
 }
 
 static pdf_status p_set_stroke_color(pdf_page page, const pdf_color *c)
@@ -1255,6 +1663,10 @@ static pdf_status p_set_stroke_color(pdf_page page, const pdf_color *c)
     catch (const std::exception &e)
     {
         return pf_catch(d, e, "SetStrokingColor");
+    }
+    catch (...)
+    {
+        return pf_foreign(d);
     }
 }
 
@@ -1276,6 +1688,10 @@ static pdf_status p_set_opacity(pdf_page page, double fill_alpha,
     catch (const std::exception &e)
     {
         return pf_catch(d, e, "SetExtGState");
+    }
+    catch (...)
+    {
+        return pf_foreign(d);
     }
 }
 
@@ -1306,8 +1722,41 @@ static pdf_status p_set_blend_mode(pdf_page page, pdf_blend_mode mode)
     {
         return pf_catch(d, e, "blend mode");
     }
+    catch (...)
+    {
+        return pf_foreign(d);
+    }
 }
 
+/* Text rendering mode.
+ *
+ * PdfPainter cannot express this, so the adapter writes the "/Tr"
+ * operator itself rather than using the painter's bookkeeping. Two
+ * upstream defects make the painter unusable here:
+ *
+ *  1. PdfPainter::SetTextRenderingMode() records the mode but writes the
+ *     operator only `if (m_isTextOpen)` - and even then it only stages it
+ *     into an internal buffer (SetCurrentTextRenderingMode appends to
+ *     m_oss) that nothing ever flushes. Called between text objects,
+ *     which is how a page-level API like this one is used, it is a
+ *     complete no-op.
+ *
+ *  2. PdfPainter::DrawText() emits the operator only when the mode is not
+ *     Fill, treating Fill as "the PDF default, so nothing to emit". That
+ *     is true only for the FIRST text object of a content stream: /Tr is
+ *     text state, so once "3 Tr" has been written every later text object
+ *     inherits it until something says otherwise - and the painter never
+ *     will.
+ *
+ * Together they mean STROKE followed by FILL leaves the rest of the page
+ * stroked, and INVISIBLE followed by FILL makes every later word vanish
+ * while every call still returns success. A stroked heading or an
+ * invisible watermark silently destroys the whole page after it.
+ *
+ * The painter's own mode is therefore left alone (it stays at Fill, so
+ * DrawText never writes a conflicting operator) and the operator is
+ * appended to the content stream by apply_text_render_mode() at the point
+ * of use. The requested mode is only recorded here. */
 static pdf_status p_set_text_render_mode(pdf_page page,
                                          pdf_text_render_mode mode)
 {
@@ -1317,30 +1766,16 @@ static pdf_status p_set_text_render_mode(pdf_page page,
         pdf_status st = paint_on(d, page_of(page));
         if (st != PDF_OK)
             return st;
-        switch (mode)
-        {
-            case PDF_TEXT_RENDER_STROKE:
-                d->painter->SetTextRenderingMode(
-                    PoDoFo::ePdfTextRenderingMode_Stroke);
-                break;
-            case PDF_TEXT_RENDER_FILL_STROKE:
-                d->painter->SetTextRenderingMode(
-                    PoDoFo::ePdfTextRenderingMode_FillAndStroke);
-                break;
-            case PDF_TEXT_RENDER_INVISIBLE:
-                d->painter->SetTextRenderingMode(
-                    PoDoFo::ePdfTextRenderingMode_Invisible);
-                break;
-            default:
-                d->painter->SetTextRenderingMode(
-                    PoDoFo::ePdfTextRenderingMode_Fill);
-                break;
-        }
+        d->tr_wanted = mode;
         return PDF_OK;
     }
     catch (const std::exception &e)
     {
         return pf_catch(d, e, "SetTextRenderingMode");
+    }
+    catch (...)
+    {
+        return pf_foreign(d);
     }
 }
 
@@ -1361,6 +1796,10 @@ static pdf_status p_path_move_to(pdf_page page, double x, double y)
     {
         return pf_catch(d, e, "MoveTo");
     }
+    catch (...)
+    {
+        return pf_foreign(d);
+    }
 }
 
 static pdf_status p_path_line_to(pdf_page page, double x, double y)
@@ -1377,6 +1816,10 @@ static pdf_status p_path_line_to(pdf_page page, double x, double y)
     catch (const std::exception &e)
     {
         return pf_catch(d, e, "LineTo");
+    }
+    catch (...)
+    {
+        return pf_foreign(d);
     }
 }
 
@@ -1396,6 +1839,10 @@ static pdf_status p_path_curve_to(pdf_page page, double x1, double y1,
     {
         return pf_catch(d, e, "CurveTo");
     }
+    catch (...)
+    {
+        return pf_foreign(d);
+    }
 }
 
 static pdf_status p_path_close(pdf_page page)
@@ -1413,6 +1860,10 @@ static pdf_status p_path_close(pdf_page page)
     {
         return pf_catch(d, e, "Close");
     }
+    catch (...)
+    {
+        return pf_foreign(d);
+    }
 }
 
 static pdf_status p_path_rectangle(pdf_page page, const pdf_rect *r)
@@ -1429,6 +1880,10 @@ static pdf_status p_path_rectangle(pdf_page page, const pdf_rect *r)
     catch (const std::exception &e)
     {
         return pf_catch(d, e, "Rectangle");
+    }
+    catch (...)
+    {
+        return pf_foreign(d);
     }
 }
 
@@ -1464,6 +1919,10 @@ static pdf_status p_path_paint(pdf_page page, pdf_path_paint_mode mode)
     {
         return pf_catch(d, e, "path paint");
     }
+    catch (...)
+    {
+        return pf_foreign(d);
+    }
 }
 
 static pdf_status p_path_discard(pdf_page page)
@@ -1486,16 +1945,26 @@ static pdf_status p_path_discard(pdf_page page)
     {
         return pf_catch(d, e, "path discard");
     }
+    catch (...)
+    {
+        return pf_foreign(d);
+    }
 }
 
 /* ----- images ---------------------------------------------------------------------------- */
 
+/* Takes ownership of `img`: it is handed to the cell on success and
+ * deleted here on an allocation failure, so the caller never has to
+ * worry about which branch ran. */
 static pdf_status make_image_cell(podofo_doc *d, PoDoFo::PdfImage *img,
                                   pdf_image *out_image)
 {
     podofo_obj *o = new (std::nothrow) podofo_obj();
     if (!o)
+    {
+        delete img;
         return PDF_ERR_OUT_OF_MEMORY;
+    }
     o->kind = PFOBJ_IMAGE;
     o->owner = d;
     o->image = img;
@@ -1504,6 +1973,7 @@ static pdf_status make_image_cell(podofo_doc *d, PoDoFo::PdfImage *img,
     if (!*out_image)
     {
         delete o;
+        delete img;
         return PDF_ERR_OUT_OF_MEMORY;
     }
     (*out_image)->vt = &g_podofo_vt;
@@ -1517,14 +1987,20 @@ static pdf_status p_image_load_file(pdf_backend_doc *doc, const char *path,
     podofo_doc *d = D(doc);
     try
     {
-        /* owned by us; document takes over the object when written */
-        PoDoFo::PdfImage *img = new PoDoFo::PdfImage(d->pdoc());
+        /* LoadFromFile() may throw; keep the object in an owner so a
+         * failure cannot leak it. On success the cell takes it over and
+         * the document releases it when written. */
+        std::unique_ptr<PoDoFo::PdfImage> img(new PoDoFo::PdfImage(d->pdoc()));
         img->LoadFromFile(path);
-        return make_image_cell(d, img, out_image);
+        return make_image_cell(d, img.release(), out_image);
     }
     catch (const std::exception &e)
     {
         return pf_catch(d, e, "PdfImage::LoadFromFile");
+    }
+    catch (...)
+    {
+        return pf_foreign(d);
     }
 }
 
@@ -1535,13 +2011,19 @@ static pdf_status p_image_load_memory(pdf_backend_doc *doc,
     podofo_doc *d = D(doc);
     try
     {
-        PoDoFo::PdfImage *img = new PoDoFo::PdfImage(d->pdoc());
+        /* Same ownership rule as the file loader: LoadFromData() may
+         * throw, so hold the object in an owner until it is handed over. */
+        std::unique_ptr<PoDoFo::PdfImage> img(new PoDoFo::PdfImage(d->pdoc()));
         img->LoadFromData(data, (PoDoFo::pdf_long)size);
-        return make_image_cell(d, img, out_image);
+        return make_image_cell(d, img.release(), out_image);
     }
     catch (const std::exception &e)
     {
         return pf_catch(d, e, "PdfImage::LoadFromData");
+    }
+    catch (...)
+    {
+        return pf_foreign(d);
     }
 }
 
@@ -1581,6 +2063,10 @@ static pdf_status p_draw_image(pdf_page page, pdf_image image,
     {
         return pf_catch(d, e, "DrawImage");
     }
+    catch (...)
+    {
+        return pf_foreign(d);
+    }
 }
 
 /* ----- annotations & outlines ---------------------------------------------------------------- */
@@ -1595,6 +2081,8 @@ static pdf_status p_annot_create(pdf_page page, pdf_annot_type type,
         flush_painter(d);
         if (d->streamed && d->device && d->device->status() != PDF_OK)
             return d->device->status(); /* sink already failed */
+        if (!rect || !out_annot)
+            return PDF_ERR_INVALID_PARAM;
         PoDoFo::PdfPage *p = page_of(page);
         PoDoFo::PdfRect pr(rect->x, rect->y, rect->w, rect->h);
 
@@ -1627,7 +2115,46 @@ static pdf_status p_annot_create(pdf_page page, pdf_annot_type type,
             a->SetContents(PoDoFo::PdfString(
                 reinterpret_cast<const PoDoFo::pdf_utf8 *>(content)));
 
-        /* Links are completed later through annot_link_to_page. */
+        /* LINK_URI carries the URL in `content`. Materialise it here (the
+         * libharu backend does the same) so the link actually reaches the
+         * output even when the caller never invokes annot_link_to_page -
+         * otherwise the annotation is produced with no target at all. */
+        if (type == PDF_ANNOT_LINK_URI && content && *content)
+        {
+            PoDoFo::PdfAction action(PoDoFo::ePdfAction_URI, d->pdoc());
+            action.SetURI(PoDoFo::PdfString(
+                reinterpret_cast<const PoDoFo::pdf_utf8 *>(content)));
+            a->SetAction(action);
+        }
+        /* LINK_GOTO stays deferred: the destination page is only known
+         * once the caller has added it. */
+
+        /* Highlight / Underline / Squiggly / StrikeOut are *text markup*
+         * annotations, and the PDF spec makes /QuadPoints REQUIRED on
+         * them: the quadrilateral is what tells the viewer which region
+         * to mark up. PoDoFo creates the dictionary but leaves the key
+         * unset, so a markup annotation without this is one a viewer
+         * cannot place - MuPDF falls back to INT_MIN..INT_MAX.
+         *
+         * The spec order is upper-left, upper-right, lower-left,
+         * lower-right (8 numbers per quadrilateral, n of them). */
+        if (type == PDF_ANNOT_HIGHLIGHT || type == PDF_ANNOT_UNDERLINE ||
+            type == PDF_ANNOT_SQUIGGLY  || type == PDF_ANNOT_STRIKEOUT)
+        {
+            PoDoFo::PdfArray qp;
+            double l = rect->x, b = rect->y;
+            double r = rect->x + rect->w, t = rect->y + rect->h;
+
+            qp.push_back(PoDoFo::PdfObject(l));  /* upper-left  x */
+            qp.push_back(PoDoFo::PdfObject(t));  /* upper-left  y */
+            qp.push_back(PoDoFo::PdfObject(r));  /* upper-right x */
+            qp.push_back(PoDoFo::PdfObject(t));  /* upper-right y */
+            qp.push_back(PoDoFo::PdfObject(l));  /* lower-left  x */
+            qp.push_back(PoDoFo::PdfObject(b));  /* lower-left  y */
+            qp.push_back(PoDoFo::PdfObject(r));  /* lower-right x */
+            qp.push_back(PoDoFo::PdfObject(b));  /* lower-right y */
+            a->SetQuadPoints(qp);
+        }
 
         podofo_obj *o = new (std::nothrow) podofo_obj();
         if (!o)
@@ -1649,6 +2176,10 @@ static pdf_status p_annot_create(pdf_page page, pdf_annot_type type,
     catch (const std::exception &e)
     {
         return pf_catch(d, e, "CreateAnnotation");
+    }
+    catch (...)
+    {
+        return pf_foreign(d);
     }
 }
 
@@ -1685,6 +2216,10 @@ static pdf_status p_annot_link_to_page(pdf_annot annot, pdf_page *dest,
     {
         return pf_catch(d, e, "link annot");
     }
+    catch (...)
+    {
+        return pf_foreign(d);
+    }
 }
 
 static pdf_status p_annot_set_color(pdf_annot annot, const pdf_color *c)
@@ -1712,6 +2247,10 @@ static pdf_status p_annot_set_color(pdf_annot annot, const pdf_color *c)
     catch (const std::exception &e)
     {
         return pf_catch(nullptr, e, "annot color");
+    }
+    catch (...)
+    {
+        return pf_foreign(nullptr);
     }
 }
 
@@ -1744,6 +2283,10 @@ static pdf_status p_annot_set_icon(pdf_annot annot, pdf_annot_icon icon)
     {
         return pf_catch(doc_of_obj(o), e, "SetIcon");
     }
+    catch (...)
+    {
+        return pf_foreign(doc_of_obj(o));
+    }
 }
 
 static pdf_status p_annot_set_opacity(pdf_annot annot, double alpha)
@@ -1761,6 +2304,10 @@ static pdf_status p_annot_set_opacity(pdf_annot annot, double alpha)
     {
         return pf_catch(nullptr, e, "annot opacity");
     }
+    catch (...)
+    {
+        return pf_foreign(nullptr);
+    }
 }
 
 static pdf_status p_annot_set_author(pdf_annot annot, const char *author)
@@ -1777,6 +2324,10 @@ static pdf_status p_annot_set_author(pdf_annot annot, const char *author)
     catch (const std::exception &e)
     {
         return pf_catch(nullptr, e, "annot author");
+    }
+    catch (...)
+    {
+        return pf_foreign(nullptr);
     }
 }
 
@@ -1798,6 +2349,10 @@ static pdf_status p_annot_set_subject(pdf_annot annot, const char *subject)
     {
         return pf_catch(nullptr, e, "annot subject");
     }
+    catch (...)
+    {
+        return pf_foreign(nullptr);
+    }
 }
 
 static pdf_status p_annot_set_open(pdf_annot annot, int opened)
@@ -1813,6 +2368,10 @@ static pdf_status p_annot_set_open(pdf_annot annot, int opened)
     catch (const std::exception &e)
     {
         return pf_catch(nullptr, e, "annot open");
+    }
+    catch (...)
+    {
+        return pf_foreign(nullptr);
     }
 }
 
@@ -1887,6 +2446,10 @@ static pdf_status p_outline_add(pdf_backend_doc *doc, pdf_outline parent,
     {
         return pf_catch(d, e, "outline add");
     }
+    catch (...)
+    {
+        return pf_foreign(d);
+    }
 }
 
 static pdf_status p_outline_set_open(pdf_outline outline, int opened)
@@ -1905,6 +2468,10 @@ static pdf_status p_outline_set_open(pdf_outline outline, int opened)
     {
         return pf_catch(nullptr, e, "outline open");
     }
+    catch (...)
+    {
+        return pf_foreign(nullptr);
+    }
 }
 
 static void p_outline_free(pdf_outline outline)
@@ -1921,6 +2488,7 @@ static pdf_status p_doc_save_to_stream(pdf_backend_doc *doc,
     try
     {
         flush_painter(d);
+        embed_extra_subset_fonts(d);
         PoDoFo::PdfWriter writer(&d->doc->GetObjects(),
                                  d->doc->GetTrailer());
         writer.SetPdfVersion(d->doc->GetPdfVersion());
@@ -1936,6 +2504,10 @@ static pdf_status p_doc_save_to_stream(pdf_backend_doc *doc,
     catch (const std::exception &e)
     {
         return pf_catch(d, e, "Write(stream)");
+    }
+    catch (...)
+    {
+        return pf_foreign(d);
     }
 }
 

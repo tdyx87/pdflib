@@ -28,9 +28,9 @@ through **Conan**.
 
 ## Features
 
-- Documents: create, save to file or memory, stream to callback or
-  `FILE*` (`pdf_doc_save_to_stream` / `pdf_doc_save_to_FILE`), metadata
-  (title/author/...)
+- Documents: create, save to file or memory, stream to a callback or to
+  an OS handle (`pdf_doc_save_to_stream` / `pdf_doc_save_to_handle`),
+  metadata (title/author/...)
 - Pages: ISO/US standard sizes + custom sizes, rotation
 - Text: 14 standard fonts, TrueType from file/memory/system, widths,
   ascender/descender, aligned and word-wrapped paragraphs
@@ -141,10 +141,17 @@ pdf_doc_save_to_memory(doc, buf, &size);
 pdf_status my_writer(const unsigned char *data, size_t len, void *ud);
 pdf_doc_save_to_stream(doc, my_writer, userdata);
 
-/* convenience: stream into an already-open FILE* (stdout, pipe, ...);
- * the file is flushed, not closed */
-pdf_doc_save_to_FILE(doc, stdout);
+/* convenience: stream into an already-open OS handle - a Win32 HANDLE
+ * (stdout, a pipe, a socket, a spooler) or a POSIX file descriptor; the
+ * handle is written to, never closed */
+pdf_doc_save_to_handle(doc, (void *)GetStdHandle(STD_OUTPUT_HANDLE));
 ```
+
+Why a handle and not a `FILE*`: the DLL links the CRT statically, so its
+`FILE` table is private to it. A `FILE*` opened by the caller belongs to
+the caller's CRT, and the DLL's own `fwrite`/`fflush` reject it as an
+invalid parameter - which aborts the process on the spot, uncatchably.
+An OS handle is process-wide, so it means the same thing on both sides.
 
 PoDoFo streams natively (a `PdfOutputDevice` subclass forwards bytes and
 keeps xref offsets correct); libharu serializes into its internal stream
@@ -194,7 +201,7 @@ pdf_doc_free(doc);
 
 ### Sink failures mid-document (abort contract)
 
-A streaming sink (callback, `FILE*`, disk) may fail at any moment - disk
+A streaming sink (callback, OS handle, disk) may fail at any moment - disk
 full, connection dropped, consumer gone. The failure contract is:
 
 - The sink's error code propagates verbatim (e.g. `PDF_ERR_IO`); it is
@@ -389,6 +396,9 @@ pdflib/                 core + public API
     pdf_backend_podofo.cpp  PoDoFo adapter
 examples/hello_pdf.c    minimal end-to-end example
 tests/test_pdflib.c     backend-independent unit tests
+standalone/smoke.c      self-checking ABI + feature test for the DLL
+standalone/apitest.c    calls every exported entry point (both engines)
+standalone/repro-save.c minimal regression repro for the save-path crash
 tools/stress_streamed.c streamed-mode batch stress + memory tool
 driver/pdflibdrv.*      WDK-facing C ABI facade (opt-in)
 driver/drv_harness.c    ABI contract harness (loads the DLL by name)
@@ -398,6 +408,8 @@ build-mt.cmd            driver facade build (/MT, static-runtime backends)
 build-x86-xp.cmd        driver facade build (x86 + Windows XP, v141_xp)
 profiles/                conan profiles (x64 static, x86 + XP static)
 tools/check_xp_imports.py  import-table audit for Windows XP
+tools/check_api_coverage.py  asserts apitest.c references every export in pdflib.def
+tools/run-all-tests.sh   one command: build + export check + ctest, x64 and x86
 tools/xp_smoke_test.c   self-checking ABI consumer for a real XP machine
 docs/xp-validation.md   how to run that check inside an XP VM
 ```

@@ -6,3 +6,9 @@
 *.cmd text eol=crlf
 *.bat text eol=crlf
 *.ps1 text eol=crlf
+
+# The opposite for shell scripts: these are sourced/executed by bash, and a
+# CRLF checkout breaks both the shebang and `source env.sh` (the \r ends up
+# inside the last word of every line). Keep them LF regardless of the
+# machine's core.autocrlf.
+*.sh text eol=lf

@@ -32,3 +32,17 @@ CMakeUserPresets.json
 *.7z
 streamed-demo.pdf
 torn-job.pdf
+
+# MSVC toolchain binaries copied into the tree for sandboxed builds.
+# Proprietary Microsoft binaries - never commit these.
+.tools/
+
+# install output of tools/run-all-tests.sh (DLL, .lib, staged headers)
+dist/
+
+# PDFs the examples and tests write into the repo root. Anchored to the
+# root on purpose: sample PDFs kept under docs/ or tests/ still track.
+/*.pdf
+
+# local agent workspace state (memory + daily logs)
+.workbuddy-ai/

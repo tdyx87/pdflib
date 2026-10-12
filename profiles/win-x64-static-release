@@ -28,3 +28,11 @@ os=Windows
 # disabled (see conanfile.py's podofo-local options).
 [conf]
 tools.cmake.cmaketoolchain:generator=Ninja
+
+# NOTE: a [buildenv] PATH+= entry was tried here to force Meson to find the
+# MSVC linker (freetype is built with Meson, and Meson's guess_win_linker
+# crashes if a foreign link.exe such as Git's coreutils 'link' shadows it).
+# Conan 2.18 emits the entries space-separated instead of ';'-separated on
+# Windows, which corrupts PATH and hides meson itself, so the fix lives in
+# pdflib-build-env.cmd instead: it prepends a shim directory holding the
+# real cl/link/rc/mt to PATH before conan runs.

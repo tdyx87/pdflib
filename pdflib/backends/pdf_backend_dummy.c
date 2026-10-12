@@ -620,6 +620,20 @@ static pdf_status d_annot_link(pdf_annot annot, pdf_page *dest,
     return PDF_OK;
 }
 
+static pdf_status d_annot_color(pdf_annot annot, const pdf_color *c)
+{
+    /* Deliberately its own function rather than reusing d_color(): the
+     * vtable slot takes a pdf_annot, and pointing it at the page colour
+     * setter (pdf_page) is a type confusion that only happens to compile
+     * because both handles are opaque pointers. It stays harmless only as
+     * long as d_color ignores its argument - one line of real work in
+     * d_color would make pdf_annot_set_color scribble over an annotation
+     * cell. */
+    (void)annot;
+    (void)c;
+    return PDF_OK;
+}
+
 static void d_annot_free(pdf_annot annot)
 {
     free(((pdf_annot)annot)->obj);
@@ -719,7 +733,7 @@ const pdf_backend_vtable g_dummy_vt = {
 
     d_annot_create,
     d_annot_link,
-    d_color, /* annot_set_color */
+    d_annot_color, /* annot_set_color */
     NULL,    /* annot_set_icon */
     NULL,    /* annot_set_opacity */
     NULL,    /* annot_set_author */

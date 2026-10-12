@@ -27,7 +27,8 @@ struct pdf_doc_cell
     int streamed;          /* created via pdf_doc_create_streamed* */
     int finished;          /* streamed doc already completed */
     pdf_status stream_error; /* sink callback failed: torn output, fail fast; 0=healthy */
-    void *close_handle;    /* core-owned FILE* to close on finish (path ctor) */
+    void *close_handle;    /* core-owned OS handle to close on finish
+                            * (pdf_doc_create_streamed_to_file only) */
     char *sink_path;       /* heap copy of the path ctor target (to unlink) */
     void *stream_sink;     /* core trampoline state handed to the backend */
 };

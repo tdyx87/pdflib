@@ -150,8 +150,9 @@ typedef struct pdf_backend_vtable
     void       (*annot_free)(pdf_annot annot);
     pdf_status (*outline_add)(pdf_backend_doc *doc, pdf_outline parent,
                               const char *title, pdf_page *dest_page,
-                              pdf_outline *out_outline);     pdf_status (*outline_set_open)(pdf_outline outline, int opened);
-     void       (*outline_free)(pdf_outline outline);
+                              pdf_outline *out_outline);
+    pdf_status (*outline_set_open)(pdf_outline outline, int opened);
+    void       (*outline_free)(pdf_outline outline);
 
      /* --- streaming output ----------------------------------------------- */
      /* Stream the serialized document to a caller callback in chunks.

@@ -26,7 +26,7 @@ class PdfLibConan(ConanFile):
         "with_tests": True,
         "with_examples": True,
         # upstream library options
-        "libharu/*:shared": False,
+        "libharu-local/*:shared": False,
         # crypto-free podofo: the point of the 0.9.x track
         "podofo-local/*:with_openssl": False,
         "podofo-local/*:with_libidn": False,
@@ -58,7 +58,12 @@ class PdfLibConan(ConanFile):
 
     def requirements(self):
         if self.options.with_libharu:
-            self.requires("libharu/2.4.4")
+            # Local fork of the ConanCenter libharu recipe: upstream runs
+            # rmdir(share/) during packaging, which deletes 100+ binding
+            # files and is refused in a sandboxed environment. The fork
+            # skips that removal (see recipes/libharu/all/conanfile.py).
+            # Export it via: conan export recipes/libharu/all
+            self.requires("libharu-local/2.4.4")
         if self.options.with_podofo:
             # ConanCenter only packages podofo 1.0.x, which hard-depends on
             # OpenSSL. Use the bundled local recipe instead: podofo-local

@@ -1,8 +1,16 @@
 #include "pdflib/pdf_api.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 /*
  * feature_pdf - end-to-end verification of the streaming output and the
@@ -10,11 +18,40 @@
  *
  *   feature_pdf <podofo|libharu> <output-prefix> [ttf-path]
  *
- * Produces <prefix>-file.pdf   (streamed to FILE*, TTF loaded from file,
- *                               embedded when available)
+ * Produces <prefix>-file.pdf   (streamed to an OS handle, TTF loaded from
+ *                               file, embedded when available)
  *         <prefix>-stream.pdf  (streamed through the callback API)
  *         <prefix>-mem.pdf     (save_to_memory then fwrite)
+ *
+ * pdflib takes OS handles rather than FILE* for the "already open" case.
+ * The DLL links the CRT statically, so it has its own FILE table: a FILE*
+ * opened here belongs to this program's CRT and the DLL's stdio rejects
+ * it as an invalid parameter - which aborts the process. An OS handle
+ * means the same thing on both sides.
  */
+
+static void *os_open_write(const char *path)
+{
+#ifdef _WIN32
+    HANDLE h = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, NULL);
+    return (h == INVALID_HANDLE_VALUE) ? NULL : (void *)h;
+#else
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    return (fd < 0) ? NULL : (void *)(intptr_t)fd;
+#endif
+}
+
+static void os_close(void *h)
+{
+    if (!h)
+        return;
+#ifdef _WIN32
+    CloseHandle((HANDLE)h);
+#else
+    close((int)(intptr_t)h);
+#endif
+}
 
 struct sink {
     FILE *f;
@@ -193,19 +230,19 @@ int main(int argc, char **argv)
         }
     }
 
-    /* 1) streamed straight into a FILE* */
+    /* 1) streamed straight into an OS handle (here: a plain file) */
     snprintf(path, sizeof(path), "%s-file.pdf", prefix);
     {
-        FILE *f = fopen(path, "wb");
-        if (!f) { fprintf(stderr, "cannot open %s\n", path); return 1; }
-        if (pdf_doc_save_to_FILE(doc, f) != PDF_OK)
+        void *h = os_open_write(path);
+        if (!h) { fprintf(stderr, "cannot open %s\n", path); return 1; }
+        if (pdf_doc_save_to_handle(doc, h) != PDF_OK)
         {
-            fprintf(stderr, "save_to_FILE failed: %s\n", pdflib_last_error(doc));
-            fclose(f);
+            fprintf(stderr, "save_to_handle failed: %s\n", pdflib_last_error(doc));
+            os_close(h);
             return 1;
         }
-        fclose(f);
-        printf("%s: streamed to FILE*\n", path);
+        os_close(h);
+        printf("%s: streamed to an OS handle\n", path);
     }
 
     /* 2) streamed through the callback API */

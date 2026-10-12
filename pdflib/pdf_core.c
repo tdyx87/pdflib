@@ -14,9 +14,27 @@
 #include "pdf_internal.h"
 
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* The *_to_handle entry points write through the OS, not through the CRT:
+ * a Win32 HANDLE and a POSIX file descriptor are both process-wide, so -
+ * unlike a FILE* - they are meaningful inside this DLL as well as inside
+ * the caller. See handle_sink_cb below. */
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
+/* The streamed-output helpers live with the rest of the streamed-document
+ * code further down, but teardown (pdf_doc_free) has to close a handle the
+ * core owns, so the closer is forward-declared here. */
+static void handle_close(void *h);
 
 /* ------------------------------------------------------------------ */
 /* Registry                                                            */
@@ -240,7 +258,7 @@ pdf_status pdf_doc_free(pdf_doc doc)
     }
     if (doc->close_handle)
     {
-        fclose((FILE *)doc->close_handle);
+        handle_close(doc->close_handle);
         doc->close_handle = NULL;
     }
     if (doc->vt && doc->vt->doc_free)
@@ -351,16 +369,91 @@ pdf_status pdf_doc_create_streamed(pdf_stream_write_fn write_fn,
     return doc_create_streamed_common(write_fn, userdata, out_doc);
 }
 
-static pdf_status file_sink_cb(const unsigned char *data, size_t len,
-                               void *userdata)
+/* Write one chunk to a caller-owned OS handle.
+ *
+ * This deliberately does NOT go through stdio. The DLL links the CRT
+ * statically (/MT), so it owns a private FILE table; a FILE* the caller
+ * opened lives in the caller's CRT and every fwrite/fflush on it fails
+ * the CRT's stream validation. In the static CRT that failure routes to
+ * _invoke_watson -> __fastfail(FAST_FAIL_INVALID_ARG), which kills the
+ * process on the spot and cannot be caught by SEH or catch (...).
+ *
+ * An OS handle has no such problem: HANDLEs and file descriptors are
+ * process-wide objects, and WriteFile/write are plain kernel calls that
+ * do not care which CRT opened them. */
+static pdf_status handle_sink_cb(const unsigned char *data, size_t len,
+                                 void *userdata)
 {
-    FILE *f = (FILE *)userdata;
-
-    if (!f)
+    if (!userdata)
         return PDF_ERR_INVALID_PARAM;
-    if (len && fwrite(data, 1, len, f) != len)
-        return PDF_ERR_IO;
+
+#ifdef _WIN32
+    {
+        HANDLE h = (HANDLE)userdata;
+
+        while (len > 0)
+        {
+            /* WriteFile caps a single write at 1 GiB-ish; chunk it. */
+            DWORD want = (len > 0x40000000u) ? 0x40000000u : (DWORD)len;
+            DWORD done = 0;
+
+            if (!WriteFile(h, data, want, &done, NULL) || done == 0)
+                return PDF_ERR_IO;
+            data += done;
+            len -= (size_t)done;
+        }
+    }
+#else
+    {
+        int fd = (int)(intptr_t)userdata;
+
+        while (len > 0)
+        {
+            ssize_t n = write(fd, data, len);
+
+            if (n < 0)
+            {
+                if (errno == EINTR)
+                    continue;
+                return PDF_ERR_IO;
+            }
+            data += (size_t)n;
+            len -= (size_t)n;
+        }
+    }
+#endif
     return PDF_OK;
+}
+
+/* Open a path for writing as an OS handle, so the core-owned sink for
+ * pdf_doc_create_streamed_to_file() speaks the same language as every
+ * other handle sink. Returns NULL on failure. */
+static void *handle_open_for_write(const char *path)
+{
+#ifdef _WIN32
+    HANDLE h = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, NULL);
+    return (h == INVALID_HANDLE_VALUE) ? NULL : (void *)h;
+#else
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    return (fd < 0) ? NULL : (void *)(intptr_t)fd;
+#endif
+}
+
+/* Close a handle produced by handle_open_for_write(). Safe on NULL.
+ * Deliberately does NOT flush: FlushFileBuffers() blocks until a pipe
+ * reader drains, and WriteFile()/write() have no user-space buffer to
+ * drain anyway. */
+static void handle_close(void *h)
+{
+    if (!h)
+        return;
+#ifdef _WIN32
+    if (h != (void *)INVALID_HANDLE_VALUE)
+        CloseHandle((HANDLE)h);
+#else
+    close((int)(intptr_t)h);
+#endif
 }
 
 static void discard_failed_stream_file(const char *path)
@@ -372,15 +465,14 @@ static void discard_failed_stream_file(const char *path)
     }
 }
 
-/* A streamed document whose sink failed: close the sink FILE (if core
+/* A streamed document whose sink failed: close the sink handle (if core
  * owned), unlink the half-written target file and hand back the sink's
  * error. Idempotent-ish: repeated calls return the first error. */
 static pdf_status finish_handle_broken_stream(pdf_doc doc, pdf_status rc)
 {
     if (doc->close_handle)
     {
-        FILE *f = (FILE *)doc->close_handle;
-        fclose(f); /* no fflush: the file is torn up anyway */
+        handle_close(doc->close_handle);
         doc->close_handle = NULL;
     }
     if (doc->sink_path)
@@ -391,27 +483,28 @@ static pdf_status finish_handle_broken_stream(pdf_doc doc, pdf_status rc)
     return rc;
 }
 
-pdf_status pdf_doc_create_streamed_to_FILE(void *file, pdf_doc *out_doc)
+pdf_status pdf_doc_create_streamed_to_handle(void *os_handle, pdf_doc *out_doc)
 {
-    pdf_status rc = doc_create_streamed_common(file_sink_cb, file, out_doc);
-    return rc;
+    if (!os_handle)
+        return PDF_ERR_INVALID_PARAM;
+    return doc_create_streamed_common(handle_sink_cb, os_handle, out_doc);
 }
 
 pdf_status pdf_doc_create_streamed_to_file(const char *path, pdf_doc *out_doc)
 {
-    FILE *f;
+    void *h;
     pdf_status rc;
     char *path_copy = NULL;
 
     if (!out_doc || !path || !*path)
         return PDF_ERR_INVALID_PARAM;
-    f = fopen(path, "wb");
-    if (!f)
+    h = handle_open_for_write(path);
+    if (!h)
         return PDF_ERR_IO;
-    rc = doc_create_streamed_common(file_sink_cb, f, out_doc);
+    rc = doc_create_streamed_common(handle_sink_cb, h, out_doc);
     if (rc != PDF_OK)
     {
-        fclose(f);
+        handle_close(h);
         remove(path); /* failed creation must not leave an empty file */
         return rc;
     }
@@ -420,7 +513,7 @@ pdf_status pdf_doc_create_streamed_to_file(const char *path, pdf_doc *out_doc)
     path_copy = (char *)malloc(strlen(path) + 1);
     if (path_copy)
         memcpy(path_copy, path, strlen(path) + 1);
-    (*out_doc)->close_handle = f;
+    (*out_doc)->close_handle = h;
     (*out_doc)->sink_path = path_copy;
     return PDF_OK;
 }
@@ -452,9 +545,7 @@ pdf_status pdf_doc_finish(pdf_doc doc)
     doc->finished = 1;
     if (doc->close_handle)
     {
-        FILE *f = (FILE *)doc->close_handle;
-        fflush(f);
-        fclose(f);
+        handle_close(doc->close_handle);
         doc->close_handle = NULL;
     }
     return rc;
@@ -561,31 +652,16 @@ pdf_status pdf_doc_save_to_stream(pdf_doc doc, pdf_stream_write_fn write_fn,
     return rc;
 }
 
-static pdf_status file_write_cb(const unsigned char *data, size_t len,
-                                void *userdata)
-{
-    FILE *f = (FILE *)userdata;
-
-    if (!f)
-        return PDF_ERR_INVALID_PARAM;
-    if (len && fwrite(data, 1, len, f) != len)
-        return PDF_ERR_IO;
-    return PDF_OK;
-}
-
-pdf_status pdf_doc_save_to_FILE(pdf_doc doc, void *file)
+pdf_status pdf_doc_save_to_handle(pdf_doc doc, void *os_handle)
 {
     pdf_status rc;
 
     rc = check_doc(doc);
     if (rc != PDF_OK)
         return rc;
-    if (!file)
+    if (!os_handle)
         return PDF_ERR_INVALID_PARAM;
-    rc = pdf_doc_save_to_stream(doc, file_write_cb, file);
-    if (rc == PDF_OK)
-        fflush((FILE *)file);
-    return rc;
+    return pdf_doc_save_to_stream(doc, handle_sink_cb, os_handle);
 }
 
 /* ------------------------------------------------------------------ */
@@ -757,6 +833,288 @@ pdf_status pdf_page_set_rotation(pdf_page page, int degrees)
 /* Fonts                                                               */
 /* ------------------------------------------------------------------ */
 
+/* ---- TrueType Collection (.ttc) support ---------------------------- *
+ * Windows ships several very common CJK fonts as collections
+ * (simsun.ttc, msyh.ttc, mingliu.ttc, simfang.ttc ...). FreeType can
+ * open a collection, but the EMBEDDING path in PoDoFo chokes on one:
+ * subsetting a face lifted out of a collection throws an exception that
+ * is not derived from std::exception, so it cannot even be translated
+ * into a status code - it unwinds straight through the C ABI and kills
+ * the host process.
+ *
+ * Rather than special-casing each backend, the core lifts face 0 out of
+ * a collection and hands the backend a plain single-face sfnt, which is
+ * what every backend (and every other language's caller) expects. The
+ * result is that .ttc fonts embed cleanly on both engines.
+ *
+ * Layout (all integers big-endian):
+ *
+ *   TTC header    : 'ttcf' | version | numFonts | offset[numFonts]
+ *   sfnt offset[0]: sfntVersion | numTables | searchRange |
+ *                   entrySelector | rangeShift | tableRecord[numTables]
+ *   tableRecord   : tag | checkSum | offset | length   (offset is
+ *                   relative to the START OF THAT FACE, not the file)
+ */
+
+#define TTC_ALIGN4(n) (((n) + 3u) & ~3u)
+
+static unsigned ttc_get_u16(const unsigned char *p)
+{
+    return (unsigned)((p[0] << 8) | p[1]);
+}
+
+static unsigned long ttc_get_u32(const unsigned char *p)
+{
+    return ((unsigned long)p[0] << 24) | ((unsigned long)p[1] << 16) |
+           ((unsigned long)p[2] << 8) | (unsigned long)p[3];
+}
+
+static void ttc_put_u16(unsigned char *p, unsigned v)
+{
+    p[0] = (unsigned char)(v >> 8);
+    p[1] = (unsigned char)(v & 0xff);
+}
+
+static void ttc_put_u32(unsigned char *p, unsigned long v)
+{
+    p[0] = (unsigned char)((v >> 24) & 0xff);
+    p[1] = (unsigned char)((v >> 16) & 0xff);
+    p[2] = (unsigned char)((v >> 8) & 0xff);
+    p[3] = (unsigned char)(v & 0xff);
+}
+
+/* Does this buffer look like a TrueType Collection? */
+static int ttc_is_collection(const unsigned char *d, size_t n)
+{
+    return n >= 12 && d[0] == 't' && d[1] == 't' && d[2] == 'c' && d[3] == 'f';
+}
+
+/* Extract one face from a collection into a standalone sfnt.
+ * Returns 1 on success (*out is malloc'd, free with free()). */
+static int ttc_extract(const unsigned char *src, size_t src_size,
+                       unsigned face_index,
+                       unsigned char **out, size_t *out_size)
+{
+    unsigned num_fonts, i, num_tables, j;
+    unsigned long face_off, need;
+    unsigned char *dst;
+    const unsigned char *sfnt, *dir;
+    unsigned long *offs;
+
+    if (!ttc_is_collection(src, src_size))
+        return 0;
+
+    num_fonts = (unsigned)ttc_get_u32(src + 8);
+    if (num_fonts == 0 || num_fonts > 64)
+        return 0;
+    if (face_index >= num_fonts)
+        return 0;
+    if ((size_t)12 + (size_t)num_fonts * 4 > src_size)
+        return 0;
+
+    face_off = ttc_get_u32(src + 12 + face_index * 4);
+    if ((size_t)face_off + 12 > src_size)
+        return 0;
+    sfnt = src + face_off;
+
+    /* a nested collection would need recursion; bail out cleanly */
+    if (sfnt[0] == 't' && sfnt[1] == 't' && sfnt[2] == 'c' && sfnt[3] == 'f')
+        return 0;
+
+    num_tables = ttc_get_u16(sfnt + 4);
+    if (num_tables == 0 || num_tables > 512)
+        return 0;
+    if ((size_t)face_off + 12 + (size_t)num_tables * 16 > src_size)
+        return 0;
+    dir = sfnt + 12;
+
+    /* figure out how big the extracted font has to be */
+    need = 12 + (unsigned long)num_tables * 16;
+    offs = (unsigned long *)malloc((size_t)num_tables * sizeof(unsigned long));
+    if (!offs)
+        return 0;
+    for (i = 0; i < num_tables; i++)
+    {
+        const unsigned char *rec = dir + (size_t)i * 16;
+        unsigned long len = ttc_get_u32(rec + 12);
+        offs[i] = need;
+        need += TTC_ALIGN4(len);
+    }
+    if (need > (unsigned long)src_size + 12u) /* sanity: cannot grow */
+    {
+        free(offs);
+        return 0;
+    }
+
+    dst = (unsigned char *)malloc((size_t)need);
+    if (!dst)
+    {
+        free(offs);
+        return 0;
+    }
+
+    /* header */
+    memcpy(dst, sfnt, 12);
+
+    /* table directory with relocated offsets. NOTE: inside a collection
+     * the TableRecord offsets are absolute - they are measured from the
+     * start of the .ttc FILE, not from the face's own sfnt directory. */
+    for (j = 0; j < num_tables; j++)
+    {
+        const unsigned char *rec = dir + (size_t)j * 16;
+        unsigned char *out_rec = dst + 12 + (size_t)j * 16;
+        unsigned long len = ttc_get_u32(rec + 12);
+        unsigned long toff = ttc_get_u32(rec + 8);
+        unsigned long copy = len;
+
+        memcpy(out_rec, rec, 8); /* tag + checkSum */
+        ttc_put_u32(out_rec + 8, offs[j]);
+        ttc_put_u32(out_rec + 12, len); /* NEW offset within the face */
+
+        if ((size_t)toff > src_size)
+        {
+            free(offs);
+            free(dst);
+            return 0;
+        }
+        if ((size_t)toff + copy > src_size)
+            copy = (unsigned long)(src_size - (size_t)toff);
+        if (copy)
+            memcpy(dst + offs[j], src + toff, (size_t)copy);
+        /* zero the alignment padding */
+        if (len > copy)
+        {
+            unsigned long pad = TTC_ALIGN4(len) - copy;
+            if (pad > need - offs[j] - copy) /* keep inside the buffer */
+                pad = 0;
+            if (pad)
+                memset(dst + offs[j] + copy, 0, (size_t)pad);
+        }
+    }
+
+    free(offs);
+    *out = dst;
+    *out_size = (size_t)need;
+    return 1;
+}
+
+/* Load an in-memory font, transparently unwrapping a collection. */
+static pdf_status load_font_memory(pdf_doc doc, const unsigned char *data,
+                                   size_t size, int embed,
+                                   pdf_font *out_font)
+{
+    unsigned char *face = NULL;
+    size_t face_size = 0;
+    pdf_status rc;
+
+    if (!data || size == 0)
+        return PDF_ERR_INVALID_PARAM;
+    if (!doc->vt->font_load_ttf_memory)
+        return PDF_ERR_BACKEND_UNSUPPORTED;
+
+    if (ttc_is_collection(data, size) &&
+        ttc_extract(data, size, 0, &face, &face_size))
+    {
+        rc = doc->vt->font_load_ttf_memory(doc->backend_doc, face, face_size,
+                                           embed, out_font);
+        free(face);
+        return rc;
+    }
+    return doc->vt->font_load_ttf_memory(doc->backend_doc, data, size, embed,
+                                         out_font);
+}
+
+/* Read a font file and hand the backend either the path or, when it is a
+ * collection, the extracted standalone face. */
+static pdf_status load_font_file(pdf_doc doc, const char *path, int embed,
+                                 pdf_font *out_font)
+{
+    FILE *f;
+    long sz;
+    unsigned char *buf = NULL;
+    pdf_status rc;
+
+    if (!path || !*path)
+        return PDF_ERR_INVALID_PARAM;
+
+    /* Plain single-face fonts keep the original behaviour: hand the path
+     * straight to the backend, no buffering, no temp files. */
+    if (!doc->vt->font_load_ttf_memory)
+    {
+        if (!doc->vt->font_load_ttf)
+            return PDF_ERR_BACKEND_UNSUPPORTED;
+        return doc->vt->font_load_ttf(doc->backend_doc, path, embed, out_font);
+    }
+
+    f = fopen(path, "rb");
+    if (!f)
+        return PDF_ERR_IO;
+    if (fseek(f, 0, SEEK_END) != 0 || (sz = ftell(f)) < 0 ||
+        fseek(f, 0, SEEK_SET) != 0)
+    {
+        fclose(f);
+        return PDF_ERR_IO;
+    }
+    if (sz == 0)
+    {
+        fclose(f);
+        return PDF_ERR_INVALID_PARAM;
+    }
+    buf = (unsigned char *)malloc((size_t)sz);
+    if (!buf)
+    {
+        fclose(f);
+        return PDF_ERR_OUT_OF_MEMORY;
+    }
+    if (fread(buf, 1, (size_t)sz, f) != (size_t)sz)
+    {
+        free(buf);
+        fclose(f);
+        return PDF_ERR_IO;
+    }
+    fclose(f);
+
+    if (!ttc_is_collection(buf, (size_t)sz))
+    {
+        free(buf);
+        if (!doc->vt->font_load_ttf)
+            return PDF_ERR_BACKEND_UNSUPPORTED;
+        return doc->vt->font_load_ttf(doc->backend_doc, path, embed, out_font);
+    }
+
+    /* --- collection ------------------------------------------------ *
+     * Offer the backend the unwrapped face first (that is what PoDoFo
+     * needs); if the backend cannot take a memory buffer - libharu only
+     * has a file-based loader - fall back to the original path call so
+     * the backend's own error is what the caller sees. No behaviour
+     * change for backends that never supported collections either way.
+     */
+    {
+        unsigned char *face = NULL;
+        size_t face_size = 0;
+        int have_path = doc->vt->font_load_ttf != NULL;
+
+        if (ttc_extract(buf, (size_t)sz, 0, &face, &face_size))
+        {
+            rc = doc->vt->font_load_ttf_memory(doc->backend_doc, face,
+                                               face_size, embed, out_font);
+            free(face);
+            if (rc == PDF_OK || !have_path)
+            {
+                free(buf);
+                return rc;
+            }
+        }
+        else if (!have_path)
+        {
+            free(buf);
+            return PDF_ERR_BACKEND_FAILED;
+        }
+        free(buf);
+        return doc->vt->font_load_ttf(doc->backend_doc, path, embed, out_font);
+    }
+}
+
 pdf_status pdf_font_get_std(pdf_doc doc, pdf_std_font font, pdf_font *out_font)
 {
     pdf_status rc;
@@ -781,9 +1139,7 @@ pdf_status pdf_font_load_ttf(pdf_doc doc, const char *path, int embed,
         return rc;
     if (!path || !*path || !out_font)
         return PDF_ERR_INVALID_PARAM;
-    if (!doc->vt->font_load_ttf)
-        return PDF_ERR_BACKEND_UNSUPPORTED;
-    return doc->vt->font_load_ttf(doc->backend_doc, path, embed, out_font);
+    return load_font_file(doc, path, embed, out_font);
 }
 
 pdf_status pdf_font_load_ttf_memory(pdf_doc doc, const unsigned char *data,
@@ -797,10 +1153,7 @@ pdf_status pdf_font_load_ttf_memory(pdf_doc doc, const unsigned char *data,
         return rc;
     if (!data || size == 0 || !out_font)
         return PDF_ERR_INVALID_PARAM;
-    if (!doc->vt->font_load_ttf_memory)
-        return PDF_ERR_BACKEND_UNSUPPORTED;
-    return doc->vt->font_load_ttf_memory(doc->backend_doc, data, size, embed,
-                                         out_font);
+    return load_font_memory(doc, data, size, embed, out_font);
 }
 
 pdf_status pdf_font_find_system(pdf_doc doc, const char *family, int bold,
@@ -909,7 +1262,9 @@ pdf_status pdf_page_draw_text_wrapped(pdf_page page, pdf_font font,
     double ascent = 0.0;
     size_t avail;
 
-    if (!page || !font || !utf8_text || width <= 0 || size <= 0)
+    if (!page || !font)
+        return PDF_ERR_INVALID_HANDLE;
+    if (!utf8_text || width <= 0 || size <= 0)
         return PDF_ERR_INVALID_PARAM;
 
     vt = page->vt;
@@ -1001,7 +1356,22 @@ pdf_status pdf_page_draw_text_wrapped(pdf_page page, pdf_font font,
             }
         }
 
-        p = nl ? nl + 1 : p + seg_len;
+        /* Resume after the segment the wrap loop just consumed.
+         *
+         * The wrap loop walks `seg`, not `p`, and counts `seg_len` down
+         * to zero as it goes - so `p` is still sitting at the head of
+         * the segment and `p + seg_len` would advance it by nothing.
+         * The old code did exactly that, and the same paragraph was
+         * re-wrapped and re-drawn from the top of the box until
+         * `cursor_y` ran past the bottom: a 3-line paragraph in a
+         * 140pt box was painted three times over itself.
+         *
+         * `seg` is where the loop stopped, which is the newline (or the
+         * end of the string), so it is the right place to resume from. */
+        p = seg;
+        if (nl)
+            p = nl + 1;
+
         if (cursor_y < y - height)
             break; /* box exhausted */
     }
@@ -1301,7 +1671,9 @@ pdf_status pdf_path_polygon(pdf_page page, const pdf_point *pts, size_t n)
     size_t i;
     pdf_status rc;
 
-    if (!page || !pts || n < 2)
+    if (!page)
+        return PDF_ERR_INVALID_HANDLE;
+    if (!pts || n < 2)
         return PDF_ERR_INVALID_PARAM;
 
     if ((rc = pdf_path_move_to(page, pts[0].x, pts[0].y)) != PDF_OK)

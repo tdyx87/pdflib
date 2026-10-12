@@ -366,9 +366,19 @@ PDFAPI pdf_status pdf_doc_create(pdf_doc *out_doc);
 PDFAPI pdf_status pdf_doc_create_streamed(pdf_stream_write_fn write_fn,
                                           void *userdata, pdf_doc *out_doc);
 
-/** Create a streaming document written to an already-open FILE*
- *  (stdout, a pipe, a spooler handle...). Flushed on finish, not closed. */
-PDFAPI pdf_status pdf_doc_create_streamed_to_FILE(void *file, pdf_doc *out_doc);
+/** Create a streaming document written straight to an already-open OS
+ *  handle: a Win32 HANDLE on Windows (a file, pipe, socket, spooler or
+ *  GetStdHandle(...)), a file descriptor on POSIX. The handle is written
+ *  to but never closed.
+ *
+ *  Why a handle and not a FILE*: this DLL links the CRT statically, so
+ *  its FILE table is private to it. A FILE* the caller opened belongs to
+ *  the caller's CRT, and the DLL's own fwrite/fflush reject it as an
+ *  invalid parameter - which aborts the process outright and cannot be
+ *  caught. An OS handle is process-wide, so it means the same thing on
+ *  both sides of the boundary. */
+PDFAPI pdf_status pdf_doc_create_streamed_to_handle(void *os_handle,
+                                                    pdf_doc *out_doc);
 
 /** Create a streaming document written to a file path. */
 PDFAPI pdf_status pdf_doc_create_streamed_to_file(const char *path,
@@ -398,10 +408,14 @@ PDFAPI pdf_status pdf_doc_save_to_stream(pdf_doc doc,
                                          pdf_stream_write_fn write_fn,
                                          void *userdata);
 
-/** Convenience wrapper: stream the document into an already-open FILE*
- *  (e.g. stdout, a socket-backed pipe, or a file opened by the caller).
- *  The file is flushed but not closed. */
-PDFAPI pdf_status pdf_doc_save_to_FILE(pdf_doc doc, void *file);
+/** Convenience wrapper: stream the document into an already-open OS
+ *  handle (a Win32 HANDLE, or a file descriptor on POSIX) - e.g. stdout,
+ *  a pipe, a socket, or a file opened by the caller. The handle is
+ *  written to but not closed.
+ *
+ *  See pdf_doc_create_streamed_to_handle for why a handle is used
+ *  instead of a FILE*. */
+PDFAPI pdf_status pdf_doc_save_to_handle(pdf_doc doc, void *os_handle);
 
 /* ------------------------------------------------------------------ */
 /* Pages                                                               */
@@ -432,8 +446,14 @@ PDFAPI pdf_status pdf_page_set_rotation(pdf_page page, int degrees);
 /* Document info                                                       */
 /* ------------------------------------------------------------------ */
 
+/** Set one info dictionary entry.
+ *  A NULL @p utf8_value clears the entry (it is stored as the empty
+ *  string); it is not an error. */
 PDFAPI pdf_status pdf_doc_set_info(pdf_doc doc, pdf_info_key key,
                                    const char *utf8_value);
+/** Read one info dictionary entry. Call with @p buf == NULL to query the
+ *  required size in @p *inout_len (including the terminating NUL), then
+ *  again with a buffer of at least that size. */
 PDFAPI pdf_status pdf_doc_get_info(pdf_doc doc, pdf_info_key key,
                                    char *buf, size_t *inout_len);
 
@@ -562,6 +582,8 @@ typedef enum pdf_path_paint_mode
     PDF_PATH_FILL_STROKE_EVENODD
 } pdf_path_paint_mode;
 
+/** Paint the current path and clear it (PDF 'S', 'f', 'B', 'f*', 'B*').
+ *  The path is consumed: build it again before painting again. */
 PDFAPI pdf_status pdf_path_paint(pdf_page page, pdf_path_paint_mode mode);
 /** Discard the current path without painting (PDF 'n'). */
 PDFAPI pdf_status pdf_path_discard(pdf_page page);
@@ -584,8 +606,15 @@ typedef enum pdf_image_format
     PDF_IMAGE_JPEG
 } pdf_image_format;
 
+/** Load an image from a file.
+ *  A missing or undecodable file yields PDF_ERR_BACKEND_FAILED with the
+ *  path in the document's last-error text - never PDF_OK. Which formats
+ *  are accepted depends on the codecs compiled into the backend, so
+ *  treat PDF_ERR_BACKEND_UNSUPPORTED as "this build has no such codec". */
 PDFAPI pdf_status pdf_image_load_file(pdf_doc doc, const char *path,
                                       pdf_image *out_image);
+/** Load an image from a memory buffer. The buffer is copied, so the
+ *  caller may free it as soon as this returns. */
 PDFAPI pdf_status pdf_image_load_memory(pdf_doc doc,
                                         const unsigned char *data,
                                         size_t size, pdf_image *out_image);
