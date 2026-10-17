@@ -41,6 +41,14 @@ LOGDIR="$ROOT/build/logs"
 LOGDIR_REL="build/logs"
 mkdir -p "$LOGDIR"
 
+# The same rule applies to the paths given to cmake on the configure
+# line: a prefix of /f/project/... is silently taken as "F:\f\project\..."
+# (absolute on the current drive), so the DLLs get installed into a
+# directory that mirrors the whole path under the drive root instead of
+# the one that was asked for. cygpath -m gives the F:/... form that both
+# cmake and MSVC understand.
+ROOT_WIN="$(cygpath -m "$ROOT" 2>/dev/null || echo "$ROOT")"
+
 # --- arguments -------------------------------------------------------
 ARCHES=()
 CLEAN=0
@@ -118,7 +126,7 @@ run_arch() {
     # Stop MSYS from rewriting /flags into paths.
     export MSYS2_ARG_CONV_EXCL="*"
 
-    local TOOLCHAIN="$ROOT/$DEPS/build/Release/generators/conan_toolchain.cmake"
+    local TOOLCHAIN="$ROOT_WIN/$DEPS/build/Release/generators/conan_toolchain.cmake"
     if [ ! -f "$TOOLCHAIN" ]; then
         echo "[$ARCH] [FAIL] dependencies missing: $DEPS"
         echo "            run build-deps.cmd $ARCH first"
@@ -126,20 +134,21 @@ run_arch() {
     fi
 
     # 1) configure ----------------------------------------------------
-    if [ ! -f "$BUILD/build.ninja" ]; then
-        echo "[$ARCH] [1/5] configure"
-        cmake -S standalone -B "$BUILD" -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
-            -DCMAKE_PREFIX_PATH="$ROOT/$DEPS/build/Release/generators" \
-            -DCMAKE_INSTALL_PREFIX="$ROOT/dist/$ARCH" \
-            >> "$LOG" 2>&1 || {
-            echo "[$ARCH] [FAIL] configure - see $LOG"
-            return 1
-        }
-    else
-        echo "[$ARCH] [1/5] configure (reusing $BUILD)"
-    fi
+    # Always run it. It is a couple of seconds, and it is the only thing
+    # that keeps the cache in step with the flags above: a build tree
+    # configured earlier with a different install prefix keeps that
+    # prefix forever, and `cmake --install` then writes somewhere nobody
+    # looks while reporting success.
+    echo "[$ARCH] [1/5] configure"
+    cmake -S standalone -B "$BUILD" -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
+        -DCMAKE_PREFIX_PATH="$ROOT_WIN/$DEPS/build/Release/generators" \
+        -DCMAKE_INSTALL_PREFIX="$ROOT_WIN/dist/$ARCH" \
+        >> "$LOG" 2>&1 || {
+        echo "[$ARCH] [FAIL] configure - see $LOG"
+        return 1
+    }
 
     # 2) build --------------------------------------------------------
     echo "[$ARCH] [2/5] build"
@@ -154,6 +163,23 @@ run_arch() {
     if ! cmake --install "$BUILD" >> "$LOG" 2>&1; then
         echo "[$ARCH] [FAIL] install - see $LOG"
         STEP_FAIL=1
+    else
+        # Assert the files landed where the prefix says. `cmake --install`
+        # reports success even when the prefix pointed somewhere else
+        # entirely, so a silent mis-install is worth failing on.
+        local MISSING=""
+        for f in pdflib.dll lib/pdflib.lib include/pdflib.h; do
+            [ -f "dist/$ARCH/$f" ] || MISSING="$MISSING $f"
+        done
+        if [ -f "$BUILD/pdfx.dll" ]; then
+            for f in pdfx.dll lib/pdfx.lib include/pdfx/pdfx.h; do
+                [ -f "dist/$ARCH/$f" ] || MISSING="$MISSING $f"
+            done
+        fi
+        if [ -n "$MISSING" ]; then
+            echo "[$ARCH] [FAIL] install prefix did not take: missing$MISSING"
+            STEP_FAIL=1
+        fi
     fi
 
     # 4) export tables vs the .def files -------------------------------
