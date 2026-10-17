@@ -1,8 +1,14 @@
 # pdflib.dll — a single-DLL PDF generator for any language
 
 `pdflib.dll` packages **two independent PDF engines — libharu and PoDoFo — behind one
-flat C API**, and exposes that API with the style and completeness of libharu's own
-`HPDF_*` interface. Any language that can call a C DLL can generate PDFs with it:
+flat C API** (`pdf_*`, 87 exports). The native API is **not** libharu's `HPDF_*` API:
+libharu 2.4.4 declares 281 public `HPDF_*` functions and the two sets share no names.
+For existing libharu code, `compat/` adds a source/link-compatible facade
+(`hpdf.lib` static, or `pdflib_hpdf.dll`) that implements 281 `HPDF_*` entry points
+over the same core and lets `HPDF_SetBackend()` pick libharu or PoDoFo at runtime.
+`pdfx.dll` is the same facade with `HPDF_` renamed to `PDFX_` — see
+[`pdfx.dll`](#pdfxdll--the-libharu-api-with-the-prefix-swapped).
+Any language that can call a C DLL can generate PDFs with it:
 Python, .NET, Java, Go, Rust, Node.js, Delphi, VB6/VBA, PowerBuilder, C/C++ itself.
 
 ```
@@ -72,7 +78,7 @@ have a way to catch an exception that unwinds into them. So the boundary is seal
 - The smoke test drives deliberately bad inputs (NULL handles, zero-length or
   garbage font buffers, negative page sizes, unknown backends) and asserts that
   every one returns a status code. `standalone/apitest.c` does the same for all
-  84 exports, plus ~85 NULL/bad-argument cases, **and then reads every artefact
+  87 exports, plus ~85 NULL/bad-argument cases, **and then reads every artefact
   it produced back to assert on its content** — see
   [Testing what was actually written](#testing-what-was-actually-written). It is
   the reason three adapter faults were found and fixed — libharu faulting on
@@ -247,6 +253,30 @@ is the contract the rest of pdflib assumes. `test_readback` covers it: it loads
 a `.ttc`, accepts a clean refusal, and then adds a page to prove the document
 still works.
 
+### When the tests cannot write files
+
+Some environments (sandboxed agent sessions among them) deny file writes to a
+process whose executable lives inside the checked-out workspace, while the
+shell itself still writes there without complaint. The symptom is deceptive:
+`cmake --build` succeeds in that very directory, and then every test that saves
+a document fails with a permission error — `fopen` returning `EACCES`,
+surfacing as `HPDF_FILE_IO_ERROR` / `PDF_ERR_IO` from the library. The same
+binaries copied anywhere else work perfectly.
+
+Diagnose it in one step: compile a five-line program that calls `fopen(path,
+"wb")` and run it from the build directory. If it reports `errno 13` for a path
+the shell can `touch`, this is what you are hitting.
+
+```
+tools/run-all-tests.sh --out-of-tree
+```
+
+runs the suite anyway. It asks ctest which commands it would run, copies the
+`.exe` and `.dll` files to a temporary directory outside the repository, and
+executes those commands there. The result is identical on a machine without the
+restriction, and the run doubles as a check that the binaries work from the
+installed layout rather than from the build tree.
+
 ## Known engine limits
 
 Both engines work, but they do not agree on everything. These are the edges worth
@@ -331,7 +361,7 @@ and `run-examples.cmd`; `tools/run-all-tests.sh` simply chains all of them and
 adds the coverage check.
 
 `verify-exports.cmd build/x64/pdflib.dll` asserts that the export table matches
-`src/pdflib.def` exactly (84 names) and that no name is decorated — a decorated name
+`src/pdflib.def` exactly (87 names) and that no name is decorated — a decorated name
 like `_pdf_doc_create@4` would break every `GetProcAddress` caller. Run it for **both**
 architectures.
 
@@ -446,8 +476,150 @@ If the engine cannot stream (libharu), `pdf_doc_create_streamed` returns
 | `PDF_ERR_BACKEND_NOT_FOUND` | 6 | engine not compiled in |
 | `PDF_ERR_OUT_OF_MEMORY` | 7 | allocation failed |
 | `PDF_ERR_IO` | 8 | file read/write error |
+| `PDF_ERR_INVALID_STATE` | 9 | call not valid in this state (e.g. saving a streamed document) |
 
 `pdf_dll_status_string(code)` returns a human-readable string for any of these.
+
+### libharu-compatible facade (`HPDF_*`)
+
+The compat library is built by the same CMake run and installed next to the
+DLL:
+
+```bat
+cl /I include app.c lib\hpdf.lib lib\pdflib.lib
+:: runtime: pdflib.dll
+:: or:      cl /I include app.c lib\pdflib_hpdf.lib
+::           runtime: pdflib_hpdf.dll + pdflib.dll
+```
+
+```c
+#include <hpdf.h>
+HPDF_Doc pdf = HPDF_New(NULL, NULL);
+HPDF_Page page = HPDF_AddPage(pdf);
+HPDF_Page_SetSize(page, HPDF_PAGE_SIZE_A4, HPDF_PAGE_PORTRAIT);
+HPDF_Font font = HPDF_GetFont(pdf, "Helvetica", NULL);
+HPDF_Page_BeginText(page);
+HPDF_Page_SetFontAndSize(page, font, 18);
+HPDF_Page_TextOut(page, 60, 760, "same source, two engines");
+HPDF_Page_EndText(page);
+HPDF_SaveToFile(pdf, "out.pdf");
+HPDF_Free(pdf);
+```
+
+`HPDF_SetBackend(PDFLIB_HPDF_BACKEND_PODOFO)` (or `PDFLIB_BACKEND=podofo`)
+selects the engine. The facade is **source/link compatible, not a binary
+replacement** for libharu's stdcall `hpdf.dll`; link the static `hpdf.lib`
+or the cdecl `pdflib_hpdf.dll`. 219 of the 281 public entries are implemented;
+65 cold entries return `HPDF_UNSUPPORTED_FUNC`. See
+[docs/libharu-compatibility.md](docs/libharu-compatibility.md).
+
+`pdflib` itself is a **multi-backend core**, not a libharu wrapper: libharu
+and PoDoFo are the two backends compiled in today, and further PDF engines
+can be added behind `pdf_backend_vtable` without touching the `HPDF_*`
+facade. The compat layer only calls `pdf_*`; it has no engine-specific code.
+
+## `pdfx.dll` — the libharu API with the prefix swapped
+
+`pdfx` is the same facade with `HPDF_` renamed to `PDFX_` throughout. It is
+**not** a link against libharu: libharu and PoDoFo are the engines
+underneath, exactly as for `pdflib`, and the caller sees only `PDFX_New`,
+`PDFX_AddPage`, `PDFX_Page_TextOut`, … The point is that code written
+against libharu keeps its shape — same functions, same argument order, same
+return codes — while the name no longer claims to be libharu, and the
+document can be written by either engine.
+
+```c
+#include "pdfx.h"
+
+PDFX_Doc  pdf  = PDFX_New(NULL, NULL);
+PDFX_Page page = PDFX_AddPage(pdf);
+PDFX_Font font = PDFX_GetFont(pdf, "Helvetica", NULL);
+
+PDFX_Page_SetSize(page, PDFX_PAGE_SIZE_A4, PDFX_PAGE_PORTRAIT);
+PDFX_Page_BeginText(page);
+PDFX_Page_SetFontAndSize(page, font, 18);
+PDFX_Page_TextOut(page, 60, 760, "PDFX_New instead of HPDF_New");
+PDFX_Page_EndText(page);
+
+PDFX_SaveToFile(pdf, "out.pdf");
+PDFX_Free(pdf);
+```
+
+`PDFX_SetBackend(PDFLIB_PDFX_BACKEND_LIBHARU)` / `..._PODOFO` (or the
+`PDFLIB_BACKEND` environment variable) selects the engine. The same program
+produces the same document either way: the showcase's two outputs match
+page for page.
+
+### It is a separate, self-contained DLL
+
+`pdfx.dll` does not depend on `pdflib.dll`. It carries its own copy of the
+core and both engines, links the C runtime **statically**, and imports only
+`WS2_32.dll` and `KERNEL32.dll` — the same "one file, no redistributable"
+property as `pdflib.dll`.
+
+The exports come from `pdfx/pdfx.def` alone. The DLL is deliberately **not**
+built with `PDFLIB_PDFX_BUILD_DLL` and does not define `PDFLIB_SHARED`: a
+`__declspec(dllexport)` in the translation unit would add a second,
+decorated export set (`_PDFX_New@4` on x86) next to the `.def` names, and
+`GetProcAddress`/`ctypes`/P-Invoke callers would break. `run-all-tests.sh`
+compares `dumpbin /exports pdfx.dll` against `pdfx/pdfx.def` on both
+architectures for exactly this reason.
+
+```bat
+cl /I include\pdfx app.c lib\pdfx.lib
+:: runtime: pdfx.dll
+```
+
+### What differs from libharu
+
+Three things, all of them consequences of the engines rather than of the
+rename:
+
+* **Text is UTF-8, not `HPDF_*`'s encoded byte strings.** Every `PDFX_*`
+  entry point that takes text takes UTF-8. A GBK or Shift-JIS buffer will
+  not render. This is the one place where the source-level contract
+  differs from libharu, and the pdfx showcase marks it in a comment.
+* **The engine's limits are the document's limits.** JPEG decoding,
+  system-font lookup and encryption are compiled out of this PoDoFo build,
+  so those calls return an error from that backend while libharu accepts
+  them. See [Known engine limits](#known-engine-limits).
+* **Some entries are stubs.** The facade reports
+  `PDFX_UNSUPPORTED_FUNC` for the entries the core does not implement
+  (`PDFX_Page_CreateFreeTextAnnot` is one). Unlike libharu, the facade does
+  **not** call the user's error handler for these: libharu's own demos
+  install a handler that `longjmp`s out of it, so invoking it for a
+  non-fatal "not implemented" would abandon a document that is perfectly
+  good. The error number is recorded and returned instead.
+
+### Verifying it
+
+`pdfx/tests/pdfx_showcase.c` is an ordinary libharu-shaped program — it
+includes only `pdfx.h` and calls only `PDFX_*` — that builds a seven-page
+document covering all 14 standard fonts, embedded TrueType, CJK text, the
+four text render modes, paths and clipping, all 12 blend modes, images with
+and without alpha, the seven annotation types, URI and GOTO links, a table
+and a nested outline.
+
+```
+ctest --test-dir build/x64 -R pdfx_showcase      # 3061 checks
+pdfx_showcase.exe                                # also writes the PDFs
+pdfx_showcase.exe --stdout > out.pdf             # one document on stdout
+```
+
+The documents it writes are then re-read by an **independent** parser:
+
+```
+python tools/crosscheck_pdf.py --profile pdfx --render build/render \
+    pdfx-showcase-libharu.pdf pdfx-showcase-podofo.pdf
+```
+
+That check asserts, among other things, that MuPDF did not have to repair
+the file. That single flag is what caught the PoDoFo content-stream
+corruption described in
+[PoDoFo cannot restore the text rendering mode](#podofo-cannot-restore-the-text-rendering-mode)
+— the file opened, the page count was right, and every page still reported
+`incorrect data check` because an operator had been appended past the flate
+payload.
 
 ## Layout
 
@@ -461,6 +633,15 @@ pdflib/
     pdf_backend_podofo.cpp  PoDoFo adapter
     pdf_backend_dummy.c     validation backend
 include/pdflib.h         the SINGLE header a consumer includes
+compat/
+  include/hpdf.h         libharu 2.4.4 public API (source compatible)
+  hpdf_compat.c          HPDF_* -> pdf_* implementation
+  tests/                 self-check + unmodified upstream libharu demos
+pdfx/
+  include/pdfx.h         the same API with HPDF_ renamed to PDFX_
+  pdfx_compat.c          pdfx_compat = hpdf_compat with the prefix swapped
+  pdfx.def               authoritative export list (284 undecorated names)
+  tests/pdfx_showcase.c  libharu-shaped program: only includes pdfx.h
 src/
   pdflib_export.c        pdf_dll_* helpers
   pdflib.def             authoritative export list (undecorated names)
@@ -470,8 +651,11 @@ standalone/
   apitest.c              calls every exported entry point (both engines)
   repro-save.c           minimal regression repro for the save-path crash
 examples/python/         ctypes binding + streaming demo
-tools/check_exports.py    export-table verifier (DLL vs src/pdflib.def)
+tools/check_exports.py    export-table verifier (DLL vs a .def file)
 tools/check_api_coverage.py  verifier (apitest.c vs src/pdflib.def)
+tools/crosscheck_pdf.py   independent re-read of the output (PyMuPDF);
+                          --profile showcase | pdfx
+tools/run_tests_out_of_tree.py  run ctest from a temp copy of the binaries
 tools/run-all-tests.sh    one command: build + verify + ctest, x64 and x86
 pdflib-build-env.cmd     self-contained MSVC environment
 build-deps.cmd           build static engines (conan)

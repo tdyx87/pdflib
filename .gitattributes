@@ -12,3 +12,9 @@
 # inside the last word of every line). Keep them LF regardless of the
 # machine's core.autocrlf.
 *.sh text eol=lf
+
+# Same reasoning for the python tools: every one of them starts with a
+# #! line and is meant to be runnable as `./tools/foo.py` on any platform.
+# A CRLF checkout leaves a \r on the shebang, and the kernel then reports
+# "bad interpreter" instead of running the file.
+*.py text eol=lf

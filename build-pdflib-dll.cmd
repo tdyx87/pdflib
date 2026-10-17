@@ -50,7 +50,10 @@ cmake -S standalone -B "%BUILDDIR%" -G Ninja ^
 if errorlevel 1 exit /b 1
 
 echo [2/2] build + install (%ARCH%)
-cmake --build "%BUILDDIR%" --target pdflib --config Release
+rem Build the compat facade too: the install rules ship hpdf.lib and
+rem pdflib_hpdf.dll, so building only `pdflib` would make `cmake --install`
+rem fail on the missing files.
+cmake --build "%BUILDDIR%" --target pdflib hpdf pdflib_hpdf --config Release
 if errorlevel 1 exit /b 1
 cmake --install "%BUILDDIR%" --config Release
 if errorlevel 1 exit /b 1

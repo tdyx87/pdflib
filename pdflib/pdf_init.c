@@ -30,14 +30,22 @@ void pdf_ensure_backends(void)
 #if defined(_WIN32)
     static volatile LONG initialized = 0;
     LONG prev = InterlockedCompareExchange(&initialized, 1, 0);
-    if (prev == 1)
-        return; /* someone already did (or is doing) the work */
 
-    /* The winning thread runs the registrations. g_registry writes are
-     * plain stores, but every other thread only reaches this point
-     * after InterlockedCompareExchange observed 0->1 with acquire
-     * semantics (the no-op second exchange in the prev==1 path reads
-     * `initialized` atomically, publishing the stores before it). */
+    if (prev == 2)
+        return; /* fully initialized */
+    if (prev == 1)
+    {
+        /* Another thread won the race and is still registering. Wait for
+         * it to publish state 2: returning immediately (the old behavior)
+         * let the loser run document creation against a half-filled
+         * registry, so PDF_BACKEND_AUTO could come back NULL. The
+         * compare-exchange with comparand 2 performs an acquire read. */
+        while (InterlockedCompareExchange(&initialized, 2, 2) != 2)
+            Sleep(0);
+        return;
+    }
+
+    /* We won: register, then publish the fully-built registry. */
     pdf_backend_dummy_register();
 #  ifdef PDFLIB_BACKEND_LIBHARU_ENABLED
     pdf_backend_libharu_register();

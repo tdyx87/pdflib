@@ -101,6 +101,14 @@ static pdf_status haru_fail(haru_doc *d, const char *what)
         else
             snprintf(d->error, sizeof(d->error), "libharu: %s failed", what);
         HPDF_ResetError(d->pdf);
+
+        /* A file that cannot be opened or written is an I/O failure, not
+         * an engine failure. The distinction matters to a caller: "the
+         * target directory is read-only" and "the backend gave up on this
+         * document" need different responses, and only one of them means
+         * the document is still good. */
+        if (code == HPDF_FILE_OPEN_ERROR || code == HPDF_FILE_IO_ERROR)
+            return PDF_ERR_IO;
     }
     return PDF_ERR_BACKEND_FAILED;
 }
@@ -203,6 +211,11 @@ static HPDF_TextRenderingMode map_text_mode(pdf_text_render_mode mode)
         case PDF_TEXT_RENDER_STROKE: return HPDF_STROKE;
         case PDF_TEXT_RENDER_FILL_STROKE: return HPDF_FILL_THEN_STROKE;
         case PDF_TEXT_RENDER_INVISIBLE: return HPDF_INVISIBLE;
+        case PDF_TEXT_RENDER_FILL_CLIP: return HPDF_FILL_CLIPPING;
+        case PDF_TEXT_RENDER_STROKE_CLIP: return HPDF_STROKE_CLIPPING;
+        case PDF_TEXT_RENDER_FILL_STROKE_CLIP:
+            return HPDF_FILL_STROKE_CLIPPING;
+        case PDF_TEXT_RENDER_CLIP: return HPDF_CLIPPING;
         default: return HPDF_FILL;
     }
 }
@@ -552,6 +565,17 @@ static pdf_status h_page_get_size(pdf_page page, double *out_w, double *out_h)
     return PDF_OK;
 }
 
+static pdf_status h_page_set_size(pdf_page page, double w, double h)
+{
+    haru_doc *d = (haru_doc *)doc_of_page(page);
+
+    if (haru_rc(HPDF_Page_SetWidth(page_of(page), (HPDF_REAL)w), d) != PDF_OK
+        || haru_rc(HPDF_Page_SetHeight(page_of(page), (HPDF_REAL)h), d)
+               != PDF_OK)
+        return PDF_ERR_BACKEND_FAILED;
+    return PDF_OK;
+}
+
 static pdf_status h_page_set_rotation(pdf_page page, int degrees)
 {
     haru_doc *d = (haru_doc *)doc_of_page(page);
@@ -598,7 +622,11 @@ static pdf_status h_font_get_std(pdf_backend_doc *doc, pdf_std_font font,
     haru_doc *d = (haru_doc *)doc;
     HPDF_Font f;
     const char *name = std_font_name(font);
-    const char *encoding = "StandardEncoding";
+    /* pdf_api.h documents WinAnsi for the text fonts, and the PoDoFo
+     * backend uses WinAnsi too. StandardEncoding (the old value) maps
+     * several byte values differently, so the two engines produced
+     * different glyphs for the same input. */
+    const char *encoding = "WinAnsiEncoding";
 
     if (font == PDF_STD_FONT_SYMBOL || font == PDF_STD_FONT_ZAPF_DINGBATS)
         encoding = "FontSpecific";
@@ -669,7 +697,7 @@ static pdf_status h_font_find_system(pdf_backend_doc *doc, const char *family,
     if (!name)
         return PDF_ERR_BACKEND_UNSUPPORTED;
     return make_font_cell(
-        HPDF_GetFont(d->pdf, name, "StandardEncoding"), out_font);
+        HPDF_GetFont(d->pdf, name, "WinAnsiEncoding"), out_font);
 }
 
 static void h_font_free(pdf_font font)
@@ -1040,6 +1068,15 @@ static pdf_status h_path_discard(pdf_page page)
                : PDF_ERR_BACKEND_FAILED;
 }
 
+static pdf_status h_path_clip(pdf_page page, int even_odd)
+{
+    haru_doc *d = (haru_doc *)doc_of_page(page);
+    HPDF_STATUS st = even_odd ? HPDF_Page_Eoclip(page_of(page))
+                              : HPDF_Page_Clip(page_of(page));
+
+    return haru_rc(st, d) == PDF_OK ? PDF_OK : PDF_ERR_BACKEND_FAILED;
+}
+
 /* ----- images ---------------------------------------------------------------------------- */
 
 static pdf_status h_image_load_file(pdf_backend_doc *doc, const char *path,
@@ -1056,6 +1093,9 @@ static pdf_status h_image_load_file(pdf_backend_doc *doc, const char *path,
     }
     if (!img)
     {
+        /* Clear the latched error: leaving it set would make every later
+         * libharu call a silent no-op while still returning success. */
+        HPDF_ResetError(d->pdf);
         snprintf(d->error, sizeof(d->error), "cannot load image %s", path);
         return PDF_ERR_BACKEND_FAILED;
     }
@@ -1498,6 +1538,28 @@ static pdf_status h_outline_add(pdf_backend_doc *doc, pdf_outline parent,
     return PDF_OK;
 }
 
+static pdf_status h_outline_set_destination(pdf_outline outline,
+                                            pdf_page *dest_page)
+{
+    haru_outline *o = (haru_outline *)((pdf_outline)outline)->obj;
+    haru_doc *d = (haru_doc *)o->pdf;
+    HPDF_Destination dst;
+
+    /* libharu has no "clear destination" operation; creating a destination
+     * on the target page and attaching it is the supported direction. */
+    if (!dest_page || !*dest_page)
+        return PDF_ERR_BACKEND_UNSUPPORTED;
+
+    dst = HPDF_Page_CreateDestination(page_of(*dest_page));
+    if (!dst)
+        return haru_fail(d, "HPDF_Page_CreateDestination");
+    if (haru_rc(HPDF_Destination_SetFit(dst), d) != PDF_OK)
+        return PDF_ERR_BACKEND_FAILED;
+    return haru_rc(HPDF_Outline_SetDestination(o->outline, dst), d) == PDF_OK
+               ? PDF_OK
+               : PDF_ERR_BACKEND_FAILED;
+}
+
 static pdf_status h_outline_set_open(pdf_outline outline, int opened)
 {
     haru_outline *o = (haru_outline *)((pdf_outline)outline)->obj;
@@ -1595,7 +1657,11 @@ const pdf_backend_vtable g_libharu_vt = {
     NULL, /* doc_create_streamed: libharu cannot push pages to a device
            * incrementally; the core falls back to create + save_to_stream,
            * which buffers in memory (acceptable for bounded jobs). */
-    NULL  /* doc_finish: memory-mode documents have nothing to finish */
+    NULL, /* doc_finish: memory-mode documents have nothing to finish */
+
+    h_page_set_size,
+    h_path_clip,
+    h_outline_set_destination
 };
 
 void pdf_backend_libharu_register(void)

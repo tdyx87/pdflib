@@ -172,6 +172,18 @@ typedef struct pdf_backend_vtable
                                        void *userdata,
                                        pdf_backend_doc **out_doc);
      pdf_status (*doc_finish)(pdf_backend_doc *doc);
+
+     /* --- libharu-compatibility extras ------------------------------- */
+     /* Appended at the end so the positional initialisers above stay
+      * readable. All three are optional; the core maps NULL to
+      * PDF_ERR_BACKEND_UNSUPPORTED. */
+     /* Resize a page after page_add/page_add_custom. */
+     pdf_status (*page_set_size)(pdf_page page, double w, double h);
+     /* Intersect the current path with the clip region ('W'/'W*'). */
+     pdf_status (*path_clip)(pdf_page page, int even_odd);
+     /* Re-target an existing outline item (NULL detaches it). */
+     pdf_status (*outline_set_destination)(pdf_outline outline,
+                                           pdf_page *dest_page);
  } pdf_backend_vtable;
 
 /** Register a backend implementation. Called once from each backend's

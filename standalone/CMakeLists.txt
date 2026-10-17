@@ -42,19 +42,32 @@ find_package(libharu-local CONFIG REQUIRED)
 find_package(podofo       CONFIG REQUIRED)
 
 # --------------------------------------------------------------------
+# The engine sources, shared by every product DLL.
+#
+# pdfx.dll is deliberately built from these same sources rather than
+# linking pdflib.dll: the whole point of the standalone product is one
+# self-contained file, and a pdfx.dll that dragged pdflib.dll along
+# would be two files with a load-order dependency. Both DLLs therefore
+# carry their own copy of the engine, and both keep the static CRT.
+# --------------------------------------------------------------------
+set(PDFLIB_ENGINE_SOURCES
+    ${PDFLIB_ROOT}/src/pdflib_export.c
+    ${PDFLIB_ROOT}/pdflib/pdf_core.c
+    ${PDFLIB_ROOT}/pdflib/pdf_init.c
+    ${PDFLIB_ROOT}/pdflib/backends/pdf_backend_dummy.c
+    ${PDFLIB_ROOT}/pdflib/backends/pdf_backend_libharu.c
+    ${PDFLIB_ROOT}/pdflib/backends/pdf_backend_podofo.cpp
+)
+
+# --------------------------------------------------------------------
 # The DLL.
 #
 # Sources: the engine-agnostic core, the always-present dummy backend,
 # both real backends, and the export shim that pins the C ABI.
 # --------------------------------------------------------------------
 add_library(pdflib SHARED
-    ${PDFLIB_ROOT}/src/pdflib_export.c
+    ${PDFLIB_ENGINE_SOURCES}
     ${PDFLIB_ROOT}/src/pdflib.def
-    ${PDFLIB_ROOT}/pdflib/pdf_core.c
-    ${PDFLIB_ROOT}/pdflib/pdf_init.c
-    ${PDFLIB_ROOT}/pdflib/backends/pdf_backend_dummy.c
-    ${PDFLIB_ROOT}/pdflib/backends/pdf_backend_libharu.c
-    ${PDFLIB_ROOT}/pdflib/backends/pdf_backend_podofo.cpp
 )
 
 target_include_directories(pdflib
@@ -112,6 +125,152 @@ else()
 endif()
 
 # --------------------------------------------------------------------
+# pdfx.dll - the libharu-style API with the prefix swapped.
+#
+# This is what a libharu user gets: PDFX_New instead of HPDF_New,
+# PDFX_AddPage instead of HPDF_AddPage, and the same argument order and
+# return codes for the rest. The implementation is pdfx_compat.c, which
+# is plain C over the pdf_* core - it never calls libharu itself, so the
+# engine underneath is still chosen at run time (libharu or PoDoFo) by
+# PDFX_SetBackend() or PDFLIB_BACKEND.
+#
+# Deliberately NOT linked against pdflib.dll: see PDFLIB_ENGINE_SOURCES.
+# Also deliberately NOT compiled with PDFLIB_PDFX_BUILD_DLL, so no
+# __declspec(dllexport) decorates anything and pdfx.def is the single
+# source of truth for the export table. On x86 that is the difference
+# between exporting PDFX_New and exporting _PDFX_New@4.
+# --------------------------------------------------------------------
+option(PDFLIB_BUILD_PDFX "Build pdfx.dll (libharu-style PDFX_* API)" ON)
+if(PDFLIB_BUILD_PDFX)
+    add_library(pdfx SHARED
+        ${PDFLIB_ROOT}/pdfx/pdfx_compat.c
+        ${PDFLIB_ROOT}/pdfx/pdfx.def
+        ${PDFLIB_ENGINE_SOURCES})
+
+    target_include_directories(pdfx
+        PUBLIC
+            ${PDFLIB_ROOT}/pdfx/include
+        PRIVATE
+            ${PDFLIB_ROOT}          # #include "pdflib/pdf_api.h"
+            ${PDFLIB_ROOT}/pdflib   # #include "pdf_backend.h"
+    )
+
+    target_link_libraries(pdfx PRIVATE
+        libharu-local::libharu-local
+        podofo::podofo)
+
+    # PDFLIB_SHARED is intentionally absent: it would make PDFAPI expand to
+    # __declspec(dllexport) on every pdf_* entry point and add a second,
+    # decorated set of exports alongside the .def list. Inside this DLL the
+    # pdf_* symbols are ordinary externals resolved at link time.
+    target_compile_definitions(pdfx PRIVATE
+        PDFLIB_BUILDING
+        PDFLIB_BACKEND_LIBHARU_ENABLED
+        PDFLIB_BACKEND_PODOFO_ENABLED)
+
+    if(MSVC)
+        target_compile_definitions(pdfx PRIVATE _CRT_SECURE_NO_WARNINGS)
+        target_compile_options(pdfx PRIVATE /utf-8 /W3)
+        set_target_properties(pdfx PROPERTIES
+            MSVC_RUNTIME_LIBRARY "MultiThreaded"
+            OUTPUT_NAME "pdfx"
+            PREFIX ""
+            SUFFIX ".dll")
+    else()
+        target_compile_options(pdfx PRIVATE -Wall -Wextra -Wno-unused-parameter)
+        set_target_properties(pdfx PROPERTIES PREFIX "" SUFFIX ".dll")
+    endif()
+endif()
+
+# --------------------------------------------------------------------
+# libharu-compatible facade (HPDF_*).
+#
+# This is a *source/link* compatibility layer, not a second copy of the
+# libharu engine. It implements the libharu public API over the pdf_* core,
+# so an existing libharu program can be recompiled against compat/include
+# and linked with hpdf.lib (static) or pdflib_hpdf.lib (DLL), while
+# HPDF_SetBackend()/PDFLIB_BACKEND selects libharu or PoDoFo underneath.
+#
+# The static library is deliberately called hpdf.lib: replacing libharu's
+# import/static library with it is the whole point. The DLL is called
+# pdflib_hpdf.dll because a real libharu hpdf.dll may coexist on the
+# machine and the two use different calling conventions/ABIs.
+# --------------------------------------------------------------------
+option(PDFLIB_BUILD_HPDF_COMPAT "Build the libharu-compatible HPDF facade" ON)
+if(PDFLIB_BUILD_HPDF_COMPAT)
+    set(PDFLIB_HPDF_HEADERS
+        ${PDFLIB_ROOT}/compat/include/hpdf.h
+        ${PDFLIB_ROOT}/compat/include/hpdf_types.h
+        ${PDFLIB_ROOT}/compat/include/hpdf_consts.h
+        ${PDFLIB_ROOT}/compat/include/hpdf_errors.h
+        ${PDFLIB_ROOT}/compat/include/hpdf_config.h
+        ${PDFLIB_ROOT}/compat/include/hpdf_version.h)
+
+    add_library(hpdf STATIC
+        ${PDFLIB_ROOT}/compat/hpdf_compat.c
+        ${PDFLIB_HPDF_HEADERS})
+    target_include_directories(hpdf
+        PUBLIC  ${PDFLIB_ROOT}/compat/include
+        PRIVATE ${PDFLIB_ROOT})
+    target_link_libraries(hpdf PUBLIC pdflib)
+    set_target_properties(hpdf PROPERTIES OUTPUT_NAME hpdf)
+
+    add_library(pdflib_hpdf SHARED
+        ${PDFLIB_ROOT}/compat/hpdf_compat.c
+        ${PDFLIB_HPDF_HEADERS})
+    target_include_directories(pdflib_hpdf
+        PUBLIC  ${PDFLIB_ROOT}/compat/include
+        PRIVATE ${PDFLIB_ROOT})
+    target_link_libraries(pdflib_hpdf PRIVATE pdflib)
+    target_compile_definitions(pdflib_hpdf PRIVATE PDFLIB_HPDF_BUILD_DLL)
+    set_target_properties(pdflib_hpdf PROPERTIES OUTPUT_NAME pdflib_hpdf)
+
+    if(MSVC)
+        foreach(tgt hpdf pdflib_hpdf)
+            target_compile_definitions(${tgt} PRIVATE _CRT_SECURE_NO_WARNINGS)
+            target_compile_options(${tgt} PRIVATE /W3 /utf-8)
+        endforeach()
+        set_target_properties(pdflib_hpdf PROPERTIES
+            MSVC_RUNTIME_LIBRARY "MultiThreaded")
+    else()
+        foreach(tgt hpdf pdflib_hpdf)
+            target_compile_options(${tgt} PRIVATE -Wall -Wextra)
+        endforeach()
+    endif()
+
+    # A small self-checking consumer plus the unmodified libharu demos. The
+    # demos are the strongest source-compatibility test: they are literally
+    # upstream's demo sources, compiled against compat/include/hpdf.h.
+    add_executable(hpdf_compat_smoke
+        ${PDFLIB_ROOT}/compat/tests/hpdf_smoke.c)
+    target_include_directories(hpdf_compat_smoke PRIVATE
+        ${PDFLIB_ROOT}/compat/include
+        ${PDFLIB_ROOT})
+    target_link_libraries(hpdf_compat_smoke PRIVATE hpdf)
+    if(MSVC)
+        target_compile_definitions(hpdf_compat_smoke PRIVATE
+                                   _CRT_SECURE_NO_WARNINGS)
+        target_compile_options(hpdf_compat_smoke PRIVATE /W3 /utf-8)
+    endif()
+
+    set(PDFLIB_HPDF_DEMOS text_demo line_demo arc_demo link_annotation)
+    foreach(demo ${PDFLIB_HPDF_DEMOS})
+        add_executable(hpdf_demo_${demo}
+            ${PDFLIB_ROOT}/compat/tests/${demo}.c
+            ${PDFLIB_ROOT}/compat/tests/grid_sheet.c)
+        target_include_directories(hpdf_demo_${demo} PRIVATE
+            ${PDFLIB_ROOT}/compat/include
+            ${PDFLIB_ROOT}/compat/tests)
+        target_link_libraries(hpdf_demo_${demo} PRIVATE hpdf)
+        if(MSVC)
+            target_compile_definitions(hpdf_demo_${demo} PRIVATE
+                                       _CRT_SECURE_NO_WARNINGS)
+            target_compile_options(hpdf_demo_${demo} PRIVATE /W3 /utf-8)
+        endif()
+    endforeach()
+endif()
+
+# --------------------------------------------------------------------
 # Install: DLL + import lib + headers.
 #
 # The public header (include/pdflib.h) does #include "pdflib/pdf_api.h",
@@ -125,6 +284,31 @@ install(FILES ${PDFLIB_ROOT}/include/pdflib.h DESTINATION include)
 install(DIRECTORY ${PDFLIB_ROOT}/pdflib/
     DESTINATION include/pdflib
     FILES_MATCHING PATTERN "*.h")
+
+if(PDFLIB_BUILD_PDFX)
+    # pdfx.dll ships with its own headers and import library. A consumer
+    # needs pdfx/include/pdfx*.h and pdfx.lib, nothing else: the engine is
+    # inside the DLL.
+    install(TARGETS pdfx
+        RUNTIME DESTINATION .
+        ARCHIVE DESTINATION lib)
+    install(FILES
+        ${PDFLIB_ROOT}/pdfx/include/pdfx.h
+        ${PDFLIB_ROOT}/pdfx/include/pdfx_types.h
+        ${PDFLIB_ROOT}/pdfx/include/pdfx_consts.h
+        ${PDFLIB_ROOT}/pdfx/include/pdfx_errors.h
+        ${PDFLIB_ROOT}/pdfx/include/pdfx_config.h
+        ${PDFLIB_ROOT}/pdfx/include/pdfx_version.h
+        DESTINATION include/pdfx)
+endif()
+
+if(PDFLIB_BUILD_HPDF_COMPAT)
+    install(TARGETS hpdf pdflib_hpdf
+        RUNTIME DESTINATION .
+        ARCHIVE DESTINATION lib
+        LIBRARY DESTINATION lib)
+    install(FILES ${PDFLIB_HPDF_HEADERS} DESTINATION include)
+endif()
 
 # --------------------------------------------------------------------
 # Smoke test: links the import library and drives a real document
@@ -288,11 +472,39 @@ if(PDFLIB_BUILD_EXAMPLES)
 endif()
 
 # --------------------------------------------------------------------
+# pdfx_showcase: a libharu program that links pdfx.
+#
+# The source includes only "pdfx.h" and calls only PDFX_*. If this builds
+# and produces a correct document, the facade is source-compatible with a
+# libharu program that had its prefix swapped - which is the whole claim.
+# --------------------------------------------------------------------
+option(PDFLIB_BUILD_PDFX_SHOWCASE "Build the pdfx libharu-style test" ON)
+if(PDFLIB_BUILD_PDFX AND PDFLIB_BUILD_PDFX_SHOWCASE)
+    add_executable(pdfx_showcase ${PDFLIB_ROOT}/pdfx/tests/pdfx_showcase.c)
+    target_include_directories(pdfx_showcase PRIVATE
+        ${PDFLIB_ROOT}/pdfx/include
+        ${PDFLIB_ZLIB_INCLUDE_DIR})
+    target_link_libraries(pdfx_showcase PRIVATE pdfx ZLIB::ZLIB)
+    if(MSVC)
+        target_compile_definitions(pdfx_showcase PRIVATE _CRT_SECURE_NO_WARNINGS)
+        target_compile_options(pdfx_showcase PRIVATE /W3 /utf-8)
+    endif()
+endif()
+
+# --------------------------------------------------------------------
 # Test registration. `ctest` then runs the whole verification chain in
 # one go: the API coverage test on both engines, the smoke test, the
 # save-path repro, and the examples.
 # --------------------------------------------------------------------
 enable_testing()
+
+if(PDFLIB_BUILD_PDFX AND PDFLIB_BUILD_PDFX_SHOWCASE)
+    # --selftest: build both documents and assert on the serialised bytes
+    # in memory. File output is exercised separately (--stdout, redirected
+    # by the caller) because a sandboxed runner may not let a child process
+    # create files at all.
+    add_test(NAME pdfx_showcase COMMAND pdfx_showcase --selftest all)
+endif()
 
 if(PDFLIB_BUILD_APITEST)
     add_test(NAME apitest_all COMMAND pdflib_apitest all apitest)
@@ -310,6 +522,15 @@ if(PDFLIB_BUILD_EXAMPLES)
     add_test(NAME hello_pdf   COMMAND hello_pdf)
     add_test(NAME feature_pdf COMMAND feature_pdf)
     add_test(NAME streamed_pdf COMMAND streamed_pdf)
+endif()
+
+if(PDFLIB_BUILD_HPDF_COMPAT)
+    add_test(NAME hpdf_compat_smoke COMMAND hpdf_compat_smoke)
+    # Upstream libharu demos, compiled unchanged. They write <argv0>.pdf and
+    # return 0 only when every HPDF_* call succeeded.
+    foreach(demo ${PDFLIB_HPDF_DEMOS})
+        add_test(NAME hpdf_demo_${demo} COMMAND hpdf_demo_${demo})
+    endforeach()
 endif()
 
 # The coverage check is a static source comparison, so it needs no build

@@ -366,30 +366,66 @@ static PoDoFo::PdfPage *page_of(pdf_page p)
     return o->owner->pdoc()->GetPage(o->page_index);
 }
 
-/* Append a raw operator to the page's content stream.
+/* Append a raw operator to the content stream the painter is writing to.
  *
- * The painter appends its own output to this same stream as it goes, so
- * an operator written here lands exactly where it is needed in the
- * sequence. The stream is already in append mode: PdfPainter::SetPage()
- * calls BeginAppend() and FinishPage() calls EndAppend(), and paint_on()
- * guarantees the painter is attached.
+ * PdfStream::Append() is only legal while the stream is between
+ * BeginAppend() and EndAppend(), and the painter owns exactly one such
+ * scope for the lifetime of the page: PdfPainter::SetPage() opens it
+ * (BeginAppend(false)) and FinishPage() closes it. Every operator the
+ * painter emits goes through the same PdfStream, so appending here -
+ * through GetCanvas(), the public handle to that scope - lands the bytes
+ * in the right order and behind the same filter.
  *
- * Only valid while the page's /Contents is a single stream, which is what
- * CreatePage() produces. (For a /Contents ARRAY, GetContentsForAppending
- * would create a *new* stream on each call and the ordering would be
- * wrong - but pdflib only ever writes documents it created, and never
- * appends a second content stream to a page, so this cannot arise.) */
-static pdf_status append_raw_op(PoDoFo::PdfPage *page, const char *op)
+ * Two earlier attempts are worth recording, because both looked right:
+ *
+ *   - Calling stream->Append() outside any append scope trips
+ *     "Append() failed because BeginAppend() was not yet called!" in a
+ *     checked build and in a release build writes the operator as raw
+ *     bytes after the flate payload, so the content stream no longer
+ *     decompresses ("incorrect data check") and a viewer that ignores
+ *     the filter sees operators running together ("9811.8C781.8755.890").
+ *
+ *   - Opening a second scope here - BeginAppend(filters, false) around
+ *     the write - is not re-entrant. The painter's scope is already
+ *     open, so this either raises the logic error above or, with
+ *     bClearExisting=false, re-appends a filtered copy of everything
+ *     already written: the page content is duplicated, the painter's
+ *     internal state (path buffer, open text object, rendering mode) no
+ *     longer matches the bytes, and the result was a broken document
+ *     that still reported PDF_OK.
+ *
+ * The fallback branch covers the case where the painter is not currently
+ * holding the stream open (nothing else can be writing then), so the
+ * operator still gets written with the stream's own filter list instead
+ * of being dropped. */
+static pdf_status append_raw_op(podofo_doc *d, const char *op)
 {
-    PoDoFo::PdfObject *contents = page->GetContentsForAppending();
-    PoDoFo::PdfStream *stream;
+    PoDoFo::PdfStream *canvas;
 
-    if (!contents)
+    if (!d || !d->painter)
         return PDF_ERR_BACKEND_FAILED;
-    stream = contents->GetStream();
-    if (!stream)
+    canvas = d->painter->GetCanvas();
+    if (!canvas)
         return PDF_ERR_BACKEND_FAILED;
-    stream->Append(op);
+
+    if (canvas->IsAppending())
+    {
+        canvas->Append(op);
+        return PDF_OK;
+    }
+
+    {
+        PoDoFo::PdfObject *contents =
+            d->painted_page ? d->painted_page->GetContentsForAppending()
+                            : nullptr;
+        if (!contents)
+            return PDF_ERR_BACKEND_FAILED;
+        PoDoFo::TVecFilters filters =
+            PoDoFo::PdfFilterFactory::CreateFilterList(contents);
+        canvas->BeginAppend(filters, false);
+        canvas->Append(op);
+        canvas->EndAppend();
+    }
     return PDF_OK;
 }
 
@@ -397,18 +433,25 @@ static pdf_status append_raw_op(PoDoFo::PdfPage *page, const char *op)
  *
  * Called immediately before each text object, so the operator precedes
  * the text it applies to. Nothing is written when the stream already
- * carries the right mode, which keeps the output as small as libharu's. */
-static pdf_status apply_text_render_mode(podofo_doc *d, PoDoFo::PdfPage *page)
+ * carries the right mode, which keeps the output as small as libharu's.
+ *
+ * /Tr is a path-independent text-state operator, so writing it ahead of
+ * any path construction the painter still has buffered is harmless: path
+ * operators ignore text state and vice versa. */
+static pdf_status apply_text_render_mode(podofo_doc *d)
 {
-    static const char *const ops[] = { "0 Tr\n", "1 Tr\n", "2 Tr\n", "3 Tr\n" };
+    static const char *const ops[] = {
+        "0 Tr\n", "1 Tr\n", "2 Tr\n", "3 Tr\n",
+        "4 Tr\n", "5 Tr\n", "6 Tr\n", "7 Tr\n"
+    };
     int m = (int)d->tr_wanted;
 
     if (d->tr_in_stream == d->tr_wanted)
         return PDF_OK;
-    if (m < 0 || m > 3)
+    if (m < 0 || m > 7)
         m = 0;
     {
-        pdf_status st = append_raw_op(page, ops[m]);
+        pdf_status st = append_raw_op(d, ops[m]);
         if (st != PDF_OK)
             return st;
     }
@@ -511,6 +554,11 @@ static pdf_status p_doc_create(pdf_backend_doc **out_doc)
         (void)pf_catch(nullptr, e, "PdfMemDocument");
         return PDF_ERR_BACKEND_FAILED;
     }
+    catch (...)
+    {
+        delete d;
+        return pf_foreign(nullptr);
+    }
 }
 
 /* Embed the subset fonts that PoDoFo will not embed by itself.
@@ -562,6 +610,11 @@ static pdf_status p_doc_create_streamed(pdf_stream_write_fn write_fn,
         delete d;
         (void)pf_catch(nullptr, e, "PdfStreamedDocument");
         return PDF_ERR_BACKEND_FAILED;
+    }
+    catch (...)
+    {
+        delete d;
+        return pf_foreign(nullptr);
     }
 }
 
@@ -622,6 +675,24 @@ static void p_doc_free(pdf_backend_doc *doc)
 static pdf_status p_doc_save_to_file(pdf_backend_doc *doc, const char *path)
 {
     podofo_doc *d = D(doc);
+    /* Probe the target before handing it to PoDoFo.
+     *
+     * PoDoFo reports "cannot create this file" as a generic PdfError, so
+     * without this the caller would get PDF_ERR_BACKEND_FAILED - which
+     * means "the engine gave up on the document" - for something as
+     * ordinary as a read-only directory. A caller that sees that cannot
+     * tell whether retrying elsewhere will help or whether its document
+     * is broken. libharu distinguishes the two (HPDF_FILE_OPEN_ERROR), and
+     * the two engines have to agree.
+     *
+     * The probe file is created empty; PoDoFo's Write truncates it anyway,
+     * so a successful save leaves no trace of this. */
+    {
+        FILE *probe = fopen(path, "wb");
+        if (!probe)
+            return PDF_ERR_IO;
+        fclose(probe);
+    }
     try
     {
         flush_painter(d);
@@ -963,6 +1034,34 @@ static pdf_status p_page_get_size(pdf_page page, double *out_w, double *out_h)
     PF_ACCESSOR_TAIL(doc_of_obj(cell_), "PageSize");
 }
 
+static pdf_status p_page_set_size(pdf_page page, double w, double h)
+{
+    podofo_doc *d = doc_of_page(page);
+    try
+    {
+        /* PoDoFo 0.9.7 only exposes SetPageWidth/Height(int), which would
+         * truncate A4's 595.276pt to 595. Write the /MediaBox array
+         * directly so fractional sizes survive, exactly like the libharu
+         * adapter's HPDF_Page_SetWidth/SetHeight. */
+        PoDoFo::PdfArray box;
+        box.push_back(PoDoFo::PdfObject(0.0));
+        box.push_back(PoDoFo::PdfObject(0.0));
+        box.push_back(PoDoFo::PdfObject(w));
+        box.push_back(PoDoFo::PdfObject(h));
+        page_of(page)->GetObject()->GetDictionary().AddKey(
+            PoDoFo::PdfName("MediaBox"), box);
+        return PDF_OK;
+    }
+    catch (const std::exception &e)
+    {
+        return pf_catch(d, e, "SetPageSize");
+    }
+    catch (...)
+    {
+        return pf_foreign(d);
+    }
+}
+
 static pdf_status p_page_set_rotation(pdf_page page, int degrees)
 {
     podofo_doc *d = doc_of_page(page);
@@ -1274,8 +1373,52 @@ static pdf_status p_font_text_width(pdf_font font, const char *text,
         f->SetFontSize((float)size);
         const PoDoFo::PdfFontMetrics *m = f->GetFontMetrics();
         double w = 0.0;
-        for (const char *p = text; *p; ++p)
-            w += m->CharWidth((unsigned char)*p);
+        /* Decode UTF-8 to code points and measure those. The old version
+         * fed individual UTF-8 bytes to CharWidth(), so every CJK glyph
+         * (3 bytes) was counted as three Latin-width characters and
+         * wrapping/alignment drifted far from the drawn text. */
+        const unsigned char *p = (const unsigned char *)text;
+        while (*p)
+        {
+            unsigned long cp;
+            int extra;
+
+            if (p[0] < 0x80)             { cp = p[0];       extra = 0; }
+            else if ((p[0] & 0xE0) == 0xC0) { cp = p[0] & 0x1F; extra = 1; }
+            else if ((p[0] & 0xF0) == 0xE0) { cp = p[0] & 0x0F; extra = 2; }
+            else if ((p[0] & 0xF8) == 0xF0) { cp = p[0] & 0x07; extra = 3; }
+            else                         { cp = p[0];       extra = 0; }
+
+            if (extra > 0)
+            {
+                int i;
+                int ok = 1;
+                for (i = 1; i <= extra; ++i)
+                {
+                    if ((p[i] & 0xC0) != 0x80)
+                    {
+                        ok = 0;
+                        break;
+                    }
+                    cp = (cp << 6) | (p[i] & 0x3F);
+                }
+                if (!ok)
+                {
+                    cp = p[0];
+                    extra = 0;
+                }
+            }
+
+            if (cp <= 0xFFFF)
+                w += m->UnicodeCharWidth((unsigned short)cp);
+            else if (cp <= 0x10FFFF)
+            {
+                unsigned long v = cp - 0x10000;
+                w += m->UnicodeCharWidth((unsigned short)(0xD800 + (v >> 10)));
+                w += m->UnicodeCharWidth((unsigned short)(0xDC00 + (v & 0x3FF)));
+            }
+            p += 1 + extra;
+        }
         f->SetFontSize(saved);
         *out_width = w;
         return PDF_OK;
@@ -1336,7 +1479,7 @@ static pdf_status p_draw_text(pdf_page page, pdf_font font,
         /* The render-mode operator has to be in the stream before the
          * text object it applies to; the painter emits none of its own,
          * because its own mode is left at Fill for the whole document. */
-        st = apply_text_render_mode(d, page_of(page));
+        st = apply_text_render_mode(d);
         if (st != PDF_OK)
             return st;
         /* The const char* ctor treats bytes as PDFDocEncoding; the utf8
@@ -1373,7 +1516,7 @@ static pdf_status p_draw_text_aligned(pdf_page page, pdf_font font,
             return st;
         f->SetFontSize((float)size);
         d->painter->SetFont(f);
-        st = apply_text_render_mode(d, page_of(page));
+        st = apply_text_render_mode(d);
         if (st != PDF_OK)
             return st;
         PoDoFo::EPdfAlignment a = PoDoFo::ePdfAlignment_Left;
@@ -1933,17 +2076,37 @@ static pdf_status p_path_discard(pdf_page page)
         pdf_status st = paint_on(d, page_of(page));
         if (st != PDF_OK)
             return st;
-        /* 0.9.x: closing the path without painting leaves a dangling
-         * path; emulate 'n' by stroking with zero opacity is not clean.
-         * The closest supported call is EndPath-less: painter has no
-         * 'new' operator, so issue Close() then nothing. (PDF 'n' is
-         * rare; the dummy/haru backends cover it exactly.) */
-        d->painter->Close();
+        /* PdfPainter::EndPath() is exactly the PDF 'n' operator. The old
+         * implementation called Close(), which appends 'h' but leaves the
+         * path current, so the next paint re-painted the discarded
+         * geometry. */
+        d->painter->EndPath();
         return PDF_OK;
     }
     catch (const std::exception &e)
     {
         return pf_catch(d, e, "path discard");
+    }
+    catch (...)
+    {
+        return pf_foreign(d);
+    }
+}
+
+static pdf_status p_path_clip(pdf_page page, int even_odd)
+{
+    podofo_doc *d = doc_of_page(page);
+    try
+    {
+        pdf_status st = paint_on(d, page_of(page));
+        if (st != PDF_OK)
+            return st;
+        d->painter->Clip(even_odd != 0);
+        return PDF_OK;
+    }
+    catch (const std::exception &e)
+    {
+        return pf_catch(d, e, "path clip");
     }
     catch (...)
     {
@@ -2452,6 +2615,30 @@ static pdf_status p_outline_add(pdf_backend_doc *doc, pdf_outline parent,
     }
 }
 
+static pdf_status p_outline_set_destination(pdf_outline outline,
+                                            pdf_page *dest_page)
+{
+    podofo_obj *o = O(((pdf_outline)outline)->obj);
+    podofo_doc *d = doc_of_obj(o);
+    try
+    {
+        if (!o->outline)
+            return PDF_ERR_INVALID_PARAM;
+        if (!dest_page || !*dest_page)
+            return PDF_ERR_BACKEND_UNSUPPORTED; /* no clear-destination API */
+        o->outline->SetDestination(PoDoFo::PdfDestination(page_of(*dest_page)));
+        return PDF_OK;
+    }
+    catch (const std::exception &e)
+    {
+        return pf_catch(d, e, "outline destination");
+    }
+    catch (...)
+    {
+        return pf_foreign(d);
+    }
+}
+
 static pdf_status p_outline_set_open(pdf_outline outline, int opened)
 {
     podofo_obj *o = O(((pdf_outline)outline)->obj);
@@ -2589,7 +2776,11 @@ const pdf_backend_vtable g_podofo_vt = {
     p_outline_free,
     p_doc_save_to_stream,
     p_doc_create_streamed,
-    p_doc_finish
+    p_doc_finish,
+
+    p_page_set_size,
+    p_path_clip,
+    p_outline_set_destination
 };
 
 /* ----- registration ------------------------------------------------------------------------ */

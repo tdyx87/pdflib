@@ -81,7 +81,9 @@ typedef enum pdf_status
     PDF_ERR_BACKEND_FAILED = 5,        /* backend reported an error */
     PDF_ERR_BACKEND_NOT_FOUND = 6,     /* backend was never registered */
     PDF_ERR_OUT_OF_MEMORY = 7,
-    PDF_ERR_IO = 8                     /* file could not be read/written */
+    PDF_ERR_IO = 8,                    /* file could not be read/written */
+    PDF_ERR_INVALID_STATE = 9          /* call not valid in the object's state
+                                        * (e.g. saving a streamed document) */
 } pdf_status;
 
 typedef enum pdf_backend
@@ -175,7 +177,13 @@ typedef enum pdf_text_render_mode
     PDF_TEXT_RENDER_FILL = 0,
     PDF_TEXT_RENDER_STROKE = 1,
     PDF_TEXT_RENDER_FILL_STROKE = 2,
-    PDF_TEXT_RENDER_INVISIBLE = 3
+    PDF_TEXT_RENDER_INVISIBLE = 3,
+    /* Add the text to the clipping path instead of painting it
+     * (libharu's HPDF_*_CLIPPING modes, PDF 'Tr' 4..7). */
+    PDF_TEXT_RENDER_FILL_CLIP = 4,
+    PDF_TEXT_RENDER_STROKE_CLIP = 5,
+    PDF_TEXT_RENDER_FILL_STROKE_CLIP = 6,
+    PDF_TEXT_RENDER_CLIP = 7
 } pdf_text_render_mode;
 
 typedef enum pdf_blend_mode
@@ -389,7 +397,9 @@ PDFAPI pdf_status pdf_doc_create_streamed_to_file(const char *path,
  *  pdf_doc_free(). On regular (memory) documents this is a no-op. */
 PDFAPI pdf_status pdf_doc_finish(pdf_doc doc);
 
-/** Save the document to a file (always a full save). */
+/** Save the document to a file (always a full save).
+ *  On a streamed document this returns PDF_ERR_INVALID_STATE: output is
+ *  already bound to the sink at creation time. */
 PDFAPI pdf_status pdf_doc_save_to_file(pdf_doc doc, const char *path);
 
 /** Serialize the document into a caller-allocated buffer.
@@ -438,6 +448,16 @@ PDFAPI pdf_status pdf_doc_page_count(pdf_doc doc, size_t *out_count);
 
 PDFAPI pdf_status pdf_page_get_size(pdf_page page, double *out_w,
                                     double *out_h);
+
+/** Resize an existing page (PDF points; origin bottom-left).
+ *
+ *  libharu's HPDF_AddPage creates an A4 page and HPDF_Page_SetSize changes it
+ *  afterwards. The pdflib page_add* calls pick the size up front; this call
+ *  exists so a libharu-shaped API can be built on top without buffering the
+ *  page, and so callers that only learn the media size later can still use
+ *  the same page handle. */
+PDFAPI pdf_status pdf_page_set_size(pdf_page page, double width,
+                                    double height);
 
 /** Rotate page content by a multiple of 90 degrees (clockwise). */
 PDFAPI pdf_status pdf_page_set_rotation(pdf_page page, int degrees);
@@ -588,6 +608,11 @@ PDFAPI pdf_status pdf_path_paint(pdf_page page, pdf_path_paint_mode mode);
 /** Discard the current path without painting (PDF 'n'). */
 PDFAPI pdf_status pdf_path_discard(pdf_page page);
 
+/** Intersect the current path with the clipping region (PDF 'W' / 'W*').
+ *  The path remains current, as in PDF; paint or discard it afterwards.
+ *  @param even_odd non-zero selects the even-odd rule ('W*'). */
+PDFAPI pdf_status pdf_path_clip(pdf_page page, int even_odd);
+
 /** Convenience: draw a rectangle in one call. */
 PDFAPI pdf_status pdf_page_draw_rect(pdf_page page, const pdf_rect *r,
                                      pdf_path_paint_mode mode);
@@ -656,6 +681,11 @@ PDFAPI pdf_status pdf_annot_free(pdf_annot annot);
 PDFAPI pdf_status pdf_outline_add(pdf_doc doc, pdf_outline parent,
                                   const char *title, pdf_page *dest_page,
                                   pdf_outline *out_outline);
+/** Change the destination page of an existing outline item (NULL clears the
+ *  destination). libharu creates an item before it creates the destination,
+ *  so a compatibility layer needs this setter. */
+PDFAPI pdf_status pdf_outline_set_destination(pdf_outline outline,
+                                              pdf_page *dest_page);
 PDFAPI pdf_status pdf_outline_set_open(pdf_outline outline, int opened);
 /** Release the outline-item wrapper (the item stays in the outline
  *  tree). The handle is invalid after. */

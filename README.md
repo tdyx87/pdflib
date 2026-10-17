@@ -50,6 +50,46 @@ Anything a backend cannot do returns `PDF_ERR_BACKEND_UNSUPPORTED`
 instead of failing silently; the capability table is the vtable in
 `pdflib/pdf_backend.h`.
 
+## libharu-compatible API (`HPDF_*`)
+
+The native `pdflib.dll` exports **87** `pdf_*` / `pdflib_*` functions. That is
+**not** the libharu API: libharu 2.4.4 declares **281** public `HPDF_*`
+functions, and the two sets share no names. If you want to keep using
+libharu-style code, the `compat/` directory adds a source/link-compatible
+facade:
+
+- `compat/include/hpdf.h` - libharu 2.4.4 public declarations (opaque handles);
+- `compat/hpdf_compat.c` - `HPDF_*` mapped onto the stable `pdf_*` core;
+- `hpdf.lib` - static library, can replace libharu's `hpdf.lib`;
+- `pdflib_hpdf.dll` - cdecl DLL facade (links `pdflib.dll`).
+
+```c
+#include <hpdf.h>                       /* compat/include */
+
+HPDF_Doc  pdf  = HPDF_New(NULL, NULL);
+HPDF_Page page = HPDF_AddPage(pdf);
+HPDF_Page_SetSize(page, HPDF_PAGE_SIZE_A4, HPDF_PAGE_PORTRAIT);
+HPDF_Font font = HPDF_GetFont(pdf, "Helvetica", NULL);
+HPDF_Page_BeginText(page);
+HPDF_Page_SetFontAndSize(page, font, 18);
+HPDF_Page_TextOut(page, 60, 760, "same source, two engines");
+HPDF_Page_EndText(page);
+HPDF_SaveToFile(pdf, "out.pdf");
+HPDF_Free(pdf);
+```
+
+Both engines are available at runtime:
+
+```c
+HPDF_SetBackend(PDFLIB_HPDF_BACKEND_PODOFO);   /* or LIBHARU / DUMMY / AUTO */
+```
+
+or `set PDFLIB_BACKEND=podofo`. **219** of the 281 public entries are real
+implementations; **65** are cold entries (3D, ICC, shading, raw images, page
+labels, attachments...) that return `HPDF_UNSUPPORTED_FUNC` instead of
+pretending to work. See [docs/libharu-compatibility.md](docs/libharu-compatibility.md)
+for the exact mapping, semantics and limitations.
+
 ## Building
 
 ### 1) With conan (both engines)
@@ -312,16 +352,40 @@ contract and the remaining gaps.
 
 ## Adding a new backend
 
+`pdflib` is a multi-backend core, not a libharu-only library. libharu and
+PoDoFo are simply the two backends compiled in today; the native `pdf_*`
+API dispatches through `pdf_backend_vtable`, so a third engine plugs in
+below the API. The `HPDF_*` facade in `compat/` is another consumer of
+that same core: it does **not** know which engine is active, so a new
+backend automatically becomes available to both APIs.
+
 1. Create `pdflib/backends/pdf_backend_<name>.c`.
 2. Implement the functions of `pdf_backend_vtable` you support and
    assemble the table; unimplemented slots stay `NULL` and the core
    maps them to `PDF_ERR_BACKEND_UNSUPPORTED`.
 3. Add a `pdf_backend_<name>_register()` that calls
    `pdf_backend_register(PDF_BACKEND_<NAME>, &vtable)`.
-4. Hook it into `pdf_ensure_backends()` and CMake.
+4. Add the enum value to `pdf_backend` in `pdflib/pdf_api.h` (append it
+   before `PDF_BACKEND_MAX`, which currently gives eight slots), hook it
+   into `pdf_init.c` and CMake, and (optionally) add it to
+   `src/pdflib.def`/`apitest.c` only if you want a new exported helper.
+5. The `HPDF_*` facade needs no change: `HPDF_SetBackend((HPDF_UINT)id)`
+   and `pdf_doc_create()` resolve it through the same registry.
 
-Nothing else in the tree changes — the public API, the core and the
-tests are engine-agnostic.
+Two known limits for future engines:
+
+- `pdf_backend` is a fixed enum and `PDF_BACKEND_MAX` is 8. A name-based
+  selector (`pdflib_set_backend_by_name` / `HPDF_SetBackendByName`) is the
+  recommended next API addition so a backend can be added without an ABI
+  visible enum value; until then, use the enum value.
+- `HPDF_SetBackend()` accepts any **registered** backend id, so a backend
+  appended under the same enum becomes selectable without editing the
+  compatibility layer. Only `HPDF_GetBackendName()` has a small switch for
+  friendly names; unknown ids report `"unknown"`. A name-based selector is
+  the planned API so even that switch disappears.
+
+Nothing else in the tree changes — the public API, the core, the tests
+and the whole `HPDF_*` surface stay engine-agnostic.
 
 ## Tests
 
@@ -396,6 +460,10 @@ pdflib/                 core + public API
     pdf_backend_podofo.cpp  PoDoFo adapter
 examples/hello_pdf.c    minimal end-to-end example
 tests/test_pdflib.c     backend-independent unit tests
+compat/                 libharu-compatible HPDF_* facade
+  include/hpdf.h        libharu 2.4.4 public API (source compatible)
+  hpdf_compat.c         HPDF_* -> pdf_* implementation
+  tests/                self-check + unmodified upstream libharu demos
 standalone/smoke.c      self-checking ABI + feature test for the DLL
 standalone/apitest.c    calls every exported entry point (both engines)
 standalone/repro-save.c minimal regression repro for the save-path crash

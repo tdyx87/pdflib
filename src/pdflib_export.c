@@ -69,6 +69,7 @@ PDFDLL_API const char *pdf_dll_status_string(pdf_status s)
     case PDF_ERR_BACKEND_NOT_FOUND:   return "no such backend registered";
     case PDF_ERR_OUT_OF_MEMORY:       return "out of memory";
     case PDF_ERR_IO:                  return "I/O error";
+    case PDF_ERR_INVALID_STATE:       return "call not valid in this state";
     default:                          return "unrecognized status";
     }
 }

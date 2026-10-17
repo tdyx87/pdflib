@@ -12,6 +12,8 @@ option(PDFLIB_BUILD_EXAMPLES "Build the example programs" ON)
 option(PDFLIB_BUILD_DRIVER "Build the WDK-facing C ABI facade DLL (pdflibdrv)" OFF)
 option(PDFLIB_DRIVER_STATIC_CRT
        "Require pdflibdrv.dll to link the static CRT (/MT)" OFF)
+option(PDFLIB_BUILD_HPDF_COMPAT
+       "Build the libharu-compatible HPDF facade (hpdf.lib)" ON)
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -110,6 +112,34 @@ set_target_properties(pdflib PROPERTIES
     VERSION ${PROJECT_VERSION}
     SOVERSION ${PROJECT_VERSION_MAJOR}
 )
+
+# ------------------------------------------------------------------ #
+# libharu-compatible facade (optional, source-level drop-in)          #
+# ------------------------------------------------------------------ #
+if(PDFLIB_BUILD_HPDF_COMPAT)
+    add_library(hpdf STATIC
+        compat/hpdf_compat.c
+        compat/include/hpdf.h
+        compat/include/hpdf_types.h
+        compat/include/hpdf_consts.h
+        compat/include/hpdf_errors.h
+        compat/include/hpdf_config.h
+        compat/include/hpdf_version.h)
+    target_include_directories(hpdf
+        PUBLIC
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/compat/include>
+            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(hpdf PUBLIC pdflib)
+    if(MSVC)
+        target_compile_definitions(hpdf PRIVATE _CRT_SECURE_NO_WARNINGS)
+        target_compile_options(hpdf PRIVATE /W3 /utf-8)
+    else()
+        target_compile_options(hpdf PRIVATE -Wall -Wextra)
+    endif()
+    set_target_properties(hpdf PROPERTIES OUTPUT_NAME hpdf)
+endif()
 
 # ------------------------------------------------------------------ #
 # Tests                                                              #
@@ -292,3 +322,16 @@ install(EXPORT pdflibTargets
     NAMESPACE pdflib::
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/pdflib
 )
+
+if(PDFLIB_BUILD_HPDF_COMPAT)
+    install(TARGETS hpdf
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+    install(FILES
+        compat/include/hpdf.h
+        compat/include/hpdf_types.h
+        compat/include/hpdf_consts.h
+        compat/include/hpdf_errors.h
+        compat/include/hpdf_config.h
+        compat/include/hpdf_version.h
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+endif()

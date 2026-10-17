@@ -28,7 +28,14 @@ if not exist "%VCTOOLS%\bin\Hostx64\x64\cl.exe" (
 
 set "SDKROOT=C:\Program Files (x86)\Windows Kits\10"
 set "SDKVER="
-for /f "delims=" %%v in ('dir /b /o-n "%SDKROOT%\Include" 2^>nul ^| findstr /r "^10\."') do (
+rem Do not use `for /f ... ('dir | findstr')` here: in a confined shell the
+rem child cmd that for /f starts may not resolve internal commands, and the
+rem whole SDK detection then fails. Probe the known SDK versions directly
+rem (newest first) instead - no child process, no PATH assumptions.
+for %%v in (10.0.26100.0 10.0.22621.0 10.0.22000.0 10.0.20348.0 ^
+            10.0.19041.0 10.0.18362.0 10.0.17763.0 10.0.17134.0 ^
+            10.0.16299.0 10.0.15063.0 10.0.14393.0 10.0.10586.0 ^
+            10.0.10240.0) do (
     if not defined SDKVER (
         if exist "%SDKROOT%\Include\%%v\um\windows.h" set "SDKVER=%%v"
     )

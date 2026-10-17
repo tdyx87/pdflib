@@ -2,7 +2,7 @@
  * apitest.c - exhaustive consumer test for pdflib.dll.
  *
  * smoke.c proves the DLL works; this proves the DLL is COMPLETE. Every one
- * of the 84 exported entry points is called at least once, with a real
+ * of the 87 exported entry points is called at least once, with a real
  * assertion on the result, and the documents it produces are parsed back
  * and checked. tools/check_api_coverage.py enforces that mechanically by
  * diffing src/pdflib.def against this file, so a newly exported function
@@ -29,7 +29,7 @@
  *                         pdf_doc_set_page_mode_use_outlines
  *   pages                 pdf_page_add, pdf_page_add_custom,
  *                         pdf_doc_page_count, pdf_page_get_size,
- *                         pdf_page_set_rotation
+ *                         pdf_page_set_size, pdf_page_set_rotation
  *   fonts                 pdf_font_get_std, pdf_font_load_ttf,
  *                         pdf_font_load_ttf_memory, pdf_font_find_system,
  *                         pdf_font_free, pdf_font_text_width,
@@ -48,8 +48,8 @@
  *                         pdf_path_rectangle, pdf_path_circle,
  *                         pdf_path_ellipse, pdf_path_arc,
  *                         pdf_path_polygon, pdf_path_paint,
- *                         pdf_path_discard, pdf_page_draw_rect,
- *                         pdf_page_draw_line
+ *                         pdf_path_discard, pdf_path_clip,
+ *                         pdf_page_draw_rect, pdf_page_draw_line
  *   images                pdf_image_load_file, pdf_image_load_memory,
  *                         pdf_image_get_size, pdf_page_draw_image,
  *                         pdf_image_free
@@ -58,7 +58,8 @@
  *                         pdf_annot_set_opacity, pdf_annot_set_author,
  *                         pdf_annot_set_subject, pdf_annot_set_open,
  *                         pdf_annot_free, pdf_outline_add,
- *                         pdf_outline_set_open, pdf_outline_free
+ *                         pdf_outline_set_destination, pdf_outline_set_open,
+ *                         pdf_outline_free
  *
  * Exit code 0 == everything passed.
  */
@@ -1452,6 +1453,12 @@ static void test_error_paths(void)
           "page_get_size(NULL)");
     CHECK(pdf_page_set_rotation(NULL, 90) == PDF_ERR_INVALID_HANDLE,
           "page_set_rotation(NULL)");
+    CHECK(pdf_page_set_size(NULL, 100, 100) == PDF_ERR_INVALID_HANDLE,
+          "page_set_size(NULL)");
+    CHECK(pdf_path_clip(NULL, 0) == PDF_ERR_INVALID_HANDLE,
+          "path_clip(NULL)");
+    CHECK(pdf_outline_set_destination(NULL, NULL) == PDF_ERR_INVALID_HANDLE,
+          "outline_set_destination(NULL)");
     CHECK(pdf_image_get_size(NULL, &count, &count) == PDF_ERR_INVALID_HANDLE,
           "image_get_size(NULL)");
     CHECK(pdf_gstate_save(NULL) == PDF_ERR_INVALID_HANDLE, "gstate_save(NULL)");
@@ -1600,10 +1607,10 @@ static void test_error_paths(void)
         if (rc == PDF_OK)
         {
             CHECK(pdf_doc_save_to_file(sdoc, "apitest-nope.pdf")
-                  == PDF_ERR_BACKEND_FAILED,
+                  == PDF_ERR_INVALID_STATE,
                   "save_to_file on a streamed doc is refused");
             CHECK(pdf_doc_save_to_handle(sdoc, (void *)1)
-                  == PDF_ERR_BACKEND_FAILED,
+                  == PDF_ERR_INVALID_STATE,
                   "save_to_handle on a streamed doc is refused");
             pdf_doc_free(sdoc);
         }
@@ -1886,7 +1893,11 @@ static void test_outlines(pdf_doc doc, pdf_page page)
         CHECK(pdf_outline_add(doc, NULL, "Appendix (no target)", NULL, &only)
               == PDF_OK, "outline_add(no destination)");
         if (only)
+        {
+            CHECK(pdf_outline_set_destination(only, &page) == PDF_OK,
+                  "outline_set_destination");
             CHECK(pdf_outline_free(only) == PDF_OK, "outline_free(title only)");
+        }
     }
 }
 
@@ -1971,6 +1982,11 @@ static void test_document(int backend, const char *name)
                   "page_set_rotation(90)");
             CHECK(pdf_page_set_rotation(custom, 0) == PDF_OK,
                   "page_set_rotation(0)");
+            CHECK(pdf_page_set_size(custom, 320, 410) == PDF_OK,
+                  "page_set_size(320x410)");
+            CHECK(pdf_page_get_size(custom, &w, &h) == PDF_OK &&
+                  w > 319.9 && w < 320.1 && h > 409.9 && h < 410.1,
+                  "page_set_size took effect");
         }
     }
     CHECK(pdf_doc_page_count(doc, &count) == PDF_OK && count == 3,
@@ -2070,6 +2086,13 @@ static void test_document(int backend, const char *name)
     /* --- text --- */
     if (font)
     {
+        CHECK(pdf_page_draw_text(page, NULL, "null font", 60, 800, 16)
+              == PDF_ERR_INVALID_HANDLE,
+              "page_draw_text(NULL font) is rejected, not crashed");
+        CHECK(pdf_page_draw_text_aligned(page, NULL, "null font",
+                                         60, 800, 16, 400, PDF_ALIGN_LEFT)
+              == PDF_ERR_INVALID_HANDLE,
+              "page_draw_text_aligned(NULL font) is rejected, not crashed");
         CHECK(pdf_page_draw_text(page, font, "draw_text", 60, 780, 16) == PDF_OK,
               "page_draw_text");
         CHECK(pdf_page_draw_text_aligned(page, font, "aligned centre",
@@ -2107,7 +2130,7 @@ static void test_document(int backend, const char *name)
               "set_blend_mode");
     CHECK(pdf_set_blend_mode(page, PDF_BLEND_NORMAL) == PDF_OK,
           "set_blend_mode(back to normal)");
-    for (i = PDF_TEXT_RENDER_FILL; i <= PDF_TEXT_RENDER_INVISIBLE; i++)
+    for (i = PDF_TEXT_RENDER_FILL; i <= PDF_TEXT_RENDER_CLIP; i++)
         CHECK(pdf_set_text_render_mode(page, (pdf_text_render_mode)i) == PDF_OK,
               "set_text_render_mode");
     CHECK(pdf_set_text_render_mode(page, PDF_TEXT_RENDER_FILL) == PDF_OK,
@@ -2176,6 +2199,15 @@ static void test_document(int backend, const char *name)
     CHECK(pdf_path_move_to(page, 60, 320) == PDF_OK, "path_move_to (discard)");
     CHECK(pdf_path_line_to(page, 200, 320) == PDF_OK, "path_line_to (discard)");
     CHECK(pdf_path_discard(page) == PDF_OK, "path_discard");
+
+    /* clip: W and W*, each followed by a path that is clipped and painted */
+    r.x = 40; r.y = 300; r.w = 100; r.h = 60;
+    CHECK(pdf_path_rectangle(page, &r) == PDF_OK, "clip path rectangle");
+    CHECK(pdf_path_clip(page, 0) == PDF_OK, "path_clip(nonzero)");
+    CHECK(pdf_path_paint(page, PDF_PATH_STROKE) == PDF_OK, "paint clipped path");
+    CHECK(pdf_path_rectangle(page, &r) == PDF_OK, "eoclip path rectangle");
+    CHECK(pdf_path_clip(page, 1) == PDF_OK, "path_clip(even-odd)");
+    CHECK(pdf_path_discard(page) == PDF_OK, "discard clipped path");
 
     r.x = 220; r.y = 400; r.w = 80; r.h = 40;
     CHECK(pdf_page_draw_rect(page, &r, PDF_PATH_FILL_STROKE) == PDF_OK,

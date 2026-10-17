@@ -56,6 +56,7 @@ EXPORTS
     pdf_image_load_memory
     pdf_outline_add
     pdf_outline_free
+    pdf_outline_set_destination
     pdf_outline_set_open
     pdf_page_add
     pdf_page_add_custom
@@ -67,8 +68,10 @@ EXPORTS
     pdf_page_draw_text_wrapped
     pdf_page_get_size
     pdf_page_set_rotation
+    pdf_page_set_size
     pdf_path_arc
     pdf_path_circle
+    pdf_path_clip
     pdf_path_close
     pdf_path_curve_to
     pdf_path_discard

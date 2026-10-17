@@ -559,7 +559,7 @@ pdf_status pdf_doc_save_to_file(pdf_doc doc, const char *path)
     if (rc != PDF_OK)
         return rc;
     if (doc->streamed)
-        return PDF_ERR_BACKEND_FAILED; /* output already bound at creation */
+        return PDF_ERR_INVALID_STATE; /* output already bound at creation */
     if (!path || !*path)
         return PDF_ERR_INVALID_PARAM;
     if (!doc->vt->doc_save_to_file)
@@ -578,7 +578,7 @@ pdf_status pdf_doc_save_to_memory(pdf_doc doc, unsigned char *buf,
     if (rc != PDF_OK)
         return rc;
     if (doc->streamed)
-        return PDF_ERR_BACKEND_FAILED; /* output already bound at creation */
+        return PDF_ERR_INVALID_STATE; /* output already bound at creation */
     if (!inout_size)
         return PDF_ERR_INVALID_PARAM;
     if (!doc->vt->doc_save_to_memory)
@@ -594,31 +594,24 @@ static pdf_status core_stream_from_memory(pdf_doc doc,
                                           pdf_stream_write_fn write_fn,
                                           void *userdata)
 {
-    unsigned char stackbuf[8192];
-    unsigned char *buf = stackbuf;
-    size_t size = sizeof(stackbuf);
+    unsigned char *buf;
+    size_t size = 0;
     pdf_status rc;
 
-    /* one call with the stack buffer; on overflow it reports the needed
-     * size, then we retry from the heap */
-    rc = doc->vt->doc_save_to_memory(doc->backend_doc, buf, &size);
-    if (rc != PDF_OK && rc != PDF_ERR_INVALID_PARAM)
+    /* Ask for the exact size first (buf == NULL is the documented size
+     * query). The previous implementation used INVALID_PARAM from a small
+     * stack buffer as the "grow" signal, which also made a genuine parameter
+     * error look like a retriable overflow. */
+    rc = doc->vt->doc_save_to_memory(doc->backend_doc, NULL, &size);
+    if (rc != PDF_OK)
         return rc;
-    if (rc == PDF_ERR_INVALID_PARAM)
-    {
-        buf = (unsigned char *)malloc(size);
-        if (!buf)
-            return PDF_ERR_OUT_OF_MEMORY;
-        rc = doc->vt->doc_save_to_memory(doc->backend_doc, buf, &size);
-        if (rc != PDF_OK)
-        {
-            free(buf);
-            return rc;
-        }
-    }
-    rc = write_fn(buf, size, userdata);
-    if (buf != stackbuf)
-        free(buf);
+    buf = (unsigned char *)malloc(size ? size : 1);
+    if (!buf)
+        return PDF_ERR_OUT_OF_MEMORY;
+    rc = doc->vt->doc_save_to_memory(doc->backend_doc, buf, &size);
+    if (rc == PDF_OK)
+        rc = write_fn(buf, size, userdata);
+    free(buf);
     return rc;
 }
 
@@ -631,7 +624,7 @@ pdf_status pdf_doc_save_to_stream(pdf_doc doc, pdf_stream_write_fn write_fn,
     if (rc != PDF_OK)
         return rc;
     if (doc->streamed)
-        return PDF_ERR_BACKEND_FAILED; /* output already bound at creation */
+        return PDF_ERR_INVALID_STATE; /* output already bound at creation */
     if (!write_fn)
         return PDF_ERR_INVALID_PARAM;
 
@@ -691,7 +684,7 @@ pdf_status pdf_doc_get_info(pdf_doc doc, pdf_info_key key, char *buf,
     rc = check_doc(doc);
     if (rc != PDF_OK)
         return rc;
-    if (!inout_len || (!buf && *inout_len))
+    if (!inout_len)
         return PDF_ERR_INVALID_PARAM;
     if (!doc->vt->doc_get_info)
         return PDF_ERR_BACKEND_UNSUPPORTED;
@@ -771,6 +764,9 @@ pdf_status pdf_page_add(pdf_doc doc, pdf_page_size size,
         return rc;
     if ((int)size < 0 || (int)size > 6 || !out_page)
         return PDF_ERR_INVALID_PARAM;
+    if (orientation != PDF_ORIENTATION_PORTRAIT
+        && orientation != PDF_ORIENTATION_LANDSCAPE)
+        return PDF_ERR_INVALID_PARAM;
 
     w = k_page_sizes[(int)size][0];
     h = k_page_sizes[(int)size][1];
@@ -818,12 +814,28 @@ pdf_status pdf_page_get_size(pdf_page page, double *out_w, double *out_h)
     return page->vt->page_get_size(page, out_w, out_h);
 }
 
+pdf_status pdf_page_set_size(pdf_page page, double width, double height)
+{
+    if (!page)
+        return PDF_ERR_INVALID_HANDLE;
+    if (width <= 0 || height <= 0)
+        return PDF_ERR_INVALID_PARAM;
+    if (!page->vt->page_set_size)
+        return PDF_ERR_BACKEND_UNSUPPORTED;
+    return page->vt->page_set_size(page, width, height);
+}
+
 pdf_status pdf_page_set_rotation(pdf_page page, int degrees)
 {
     if (!page)
         return PDF_ERR_INVALID_HANDLE;
     if (degrees % 90 != 0)
         return PDF_ERR_INVALID_PARAM;
+    /* PDF /Rotate is 0, 90, 180 or 270; normalise negatives and values
+     * above one turn instead of handing the engine 450 or -90. */
+    degrees %= 360;
+    if (degrees < 0)
+        degrees += 360;
     if (!page->vt->page_set_rotation)
         return PDF_ERR_BACKEND_UNSUPPORTED;
     return page->vt->page_set_rotation(page, degrees);
@@ -1224,7 +1236,7 @@ pdf_status pdf_page_draw_text(pdf_page page, pdf_font font,
                               const char *utf8_text, double x, double y,
                               double size)
 {
-    if (!page)
+    if (!page || !font)
         return PDF_ERR_INVALID_HANDLE;
     if (!utf8_text)
         return PDF_ERR_INVALID_PARAM;
@@ -1238,7 +1250,7 @@ pdf_status pdf_page_draw_text_aligned(pdf_page page, pdf_font font,
                                       double y, double size, double width,
                                       pdf_align align)
 {
-    if (!page)
+    if (!page || !font)
         return PDF_ERR_INVALID_HANDLE;
     if (!utf8_text)
         return PDF_ERR_INVALID_PARAM;
@@ -1256,11 +1268,12 @@ pdf_status pdf_page_draw_text_wrapped(pdf_page page, pdf_font font,
 {
     const pdf_backend_vtable *vt;
     const char *p;
-    char line[512];
+    char *line;
     double cursor_y;
     double line_h;
     double ascent = 0.0;
     size_t avail;
+    pdf_status rc;
 
     if (!page || !font)
         return PDF_ERR_INVALID_HANDLE;
@@ -1271,6 +1284,12 @@ pdf_status pdf_page_draw_text_wrapped(pdf_page page, pdf_font font,
     if (!vt->font_text_width || !vt->draw_text_aligned)
         return PDF_ERR_BACKEND_UNSUPPORTED;
 
+    avail = strlen(utf8_text);
+    line = (char *)malloc(avail + 1);
+    if (!line)
+        return PDF_ERR_OUT_OF_MEMORY;
+    rc = PDF_OK;
+
     if (vt->font_ascent && vt->font_ascent(font, size, &ascent) == PDF_OK
         && ascent > 0)
         line_h = ascent + size * 0.25 + line_gap;
@@ -1280,7 +1299,6 @@ pdf_status pdf_page_draw_text_wrapped(pdf_page page, pdf_font font,
     /* y is the top of the box; the first baseline sits one ascent down. */
     cursor_y = y - ascent;
 
-    avail = sizeof(line) - 1;
     p = utf8_text;
     while (*p)
     {
@@ -1288,17 +1306,9 @@ pdf_status pdf_page_draw_text_wrapped(pdf_page page, pdf_font font,
         size_t seg_len = nl ? (size_t)(nl - p) : strlen(p);
         const char *seg = p;
         double seg_w = 0.0;
-        int truncated = 0;
-
-        if (seg_len > avail)
-        {
-            seg_len = avail;
-            truncated = 1;
-        }
 
         /* Fast path: whole paragraph line fits. */
-        if (!truncated
-            && vt->font_text_width(font, seg, size, &seg_w) == PDF_OK
+        if (vt->font_text_width(font, seg, size, &seg_w) == PDF_OK
             && seg_w <= width)
         {
             if (cursor_y >= y - height)
@@ -1321,7 +1331,10 @@ pdf_status pdf_page_draw_text_wrapped(pdf_page page, pdf_font font,
                 memcpy(line, seg, take);
                 line[take] = '\0';
                 if (vt->font_text_width(font, line, size, &seg_w) != PDF_OK)
-                    return PDF_ERR_BACKEND_FAILED;
+                {
+                    rc = PDF_ERR_BACKEND_FAILED;
+                    goto done;
+                }
                 if (seg_w <= width)
                     break;
                 if (take == 1)
@@ -1376,7 +1389,9 @@ pdf_status pdf_page_draw_text_wrapped(pdf_page page, pdf_font font,
             break; /* box exhausted */
     }
 
-    return PDF_OK;
+done:
+    free(line);
+    return rc;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1490,6 +1505,10 @@ pdf_status pdf_set_opacity(pdf_page page, double fill_alpha,
 {
     if (!page)
         return PDF_ERR_INVALID_HANDLE;
+    if (fill_alpha < 0) fill_alpha = 0;
+    if (fill_alpha > 1) fill_alpha = 1;
+    if (stroke_alpha < 0) stroke_alpha = 0;
+    if (stroke_alpha > 1) stroke_alpha = 1;
     if (!page->vt->set_opacity)
         return PDF_ERR_BACKEND_UNSUPPORTED;
     return page->vt->set_opacity(page, fill_alpha, stroke_alpha);
@@ -1705,6 +1724,15 @@ pdf_status pdf_path_discard(pdf_page page)
     return page->vt->path_discard(page);
 }
 
+pdf_status pdf_path_clip(pdf_page page, int even_odd)
+{
+    if (!page)
+        return PDF_ERR_INVALID_HANDLE;
+    if (!page->vt->path_clip)
+        return PDF_ERR_BACKEND_UNSUPPORTED;
+    return page->vt->path_clip(page, even_odd ? 1 : 0);
+}
+
 pdf_status pdf_page_draw_rect(pdf_page page, const pdf_rect *r,
                               pdf_path_paint_mode mode)
 {
@@ -1805,8 +1833,10 @@ pdf_status pdf_annot_create(pdf_page page, pdf_annot_type type,
                             const pdf_rect *rect, const char *utf8_content,
                             pdf_annot *out_annot)
 {
-    if (!page || !rect || !out_annot)
+    if (!page)
         return PDF_ERR_INVALID_HANDLE;
+    if (!rect || !out_annot)
+        return PDF_ERR_INVALID_PARAM;
     if (!page->vt->annot_create)
         return PDF_ERR_BACKEND_UNSUPPORTED;
     return page->vt->annot_create(page, type, rect, utf8_content, out_annot);
@@ -1817,6 +1847,10 @@ pdf_status pdf_annot_link_to_page(pdf_annot annot, pdf_page *dest,
 {
     if (!annot)
         return PDF_ERR_INVALID_HANDLE;
+    /* A GOTO link needs a destination; a URI link needs a URL. Rejecting
+     * these here keeps a NULL page pointer from reaching the backends. */
+    if ((!uri || !*uri) && (!dest || !*dest))
+        return PDF_ERR_INVALID_PARAM;
     if (!annot->vt->annot_link_to_page)
         return PDF_ERR_BACKEND_UNSUPPORTED;
     return annot->vt->annot_link_to_page(annot, dest, uri);
@@ -1895,10 +1929,23 @@ pdf_status pdf_outline_add(pdf_doc doc, pdf_outline parent, const char *title,
         return PDF_ERR_INVALID_HANDLE;
     if (!title || !out_outline)
         return PDF_ERR_INVALID_PARAM;
+    if (dest_page && !*dest_page)
+        return PDF_ERR_INVALID_PARAM;
     if (!doc->vt->outline_add)
         return PDF_ERR_BACKEND_UNSUPPORTED;
     return doc->vt->outline_add(doc->backend_doc, parent, title, dest_page,
                                 out_outline);
+}
+
+pdf_status pdf_outline_set_destination(pdf_outline outline, pdf_page *dest_page)
+{
+    if (!outline)
+        return PDF_ERR_INVALID_HANDLE;
+    if (dest_page && !*dest_page)
+        return PDF_ERR_INVALID_PARAM;
+    if (!outline->vt->outline_set_destination)
+        return PDF_ERR_BACKEND_UNSUPPORTED;
+    return outline->vt->outline_set_destination(outline, dest_page);
 }
 
 pdf_status pdf_outline_set_open(pdf_outline outline, int opened)

@@ -6,14 +6,22 @@
 #   tools/run-all-tests.sh                 # x64 and x86
 #   tools/run-all-tests.sh x64             # one architecture
 #   tools/run-all-tests.sh x86 --clean     # wipe build/<arch> first
+#   tools/run-all-tests.sh --out-of-tree   # run the tests from a temp copy
 #
 # Steps per architecture:
 #   1. configure (CMake + Ninja, conan toolchain from build/<arch>-deps)
-#   2. build every target (DLL, smoke, apitest, repro, examples)
+#   2. build every target (pdflib.dll, pdfx.dll, smoke, apitest, examples)
 #   3. install into dist/<arch>
-#   4. verify the DLL's export table against src/pdflib.def
+#   4. verify the export tables against src/pdflib.def and pdfx/pdfx.def
 #   5. verify the API test references every export
-#   6. ctest - the API coverage test on both engines, smoke, repro, examples
+#   6. run the test suite - ctest, or the out-of-tree runner
+#
+# --out-of-tree copies the executables and DLLs to a temporary directory
+# and runs the same commands there. Use it when the test binaries cannot
+# write files but the shell can: some environments deny writes to a
+# process whose image lives inside the checked-out workspace, which turns
+# every save into a bogus permission error. See
+# tools/run_tests_out_of_tree.py.
 #
 # Exits non-zero if any step of any architecture failed.
 #
@@ -36,10 +44,12 @@ mkdir -p "$LOGDIR"
 # --- arguments -------------------------------------------------------
 ARCHES=()
 CLEAN=0
+OUT_OF_TREE=0
 for arg in "$@"; do
     case "$arg" in
         x64|x86) ARCHES+=("$arg") ;;
         --clean) CLEAN=1 ;;
+        --out-of-tree) OUT_OF_TREE=1 ;;
         -h|--help) awk 'NR>1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"; exit 0 ;;
         *) echo "unknown argument: $arg" >&2; exit 2 ;;
     esac
@@ -66,6 +76,10 @@ find_python() {
     return 1
 }
 PYTHON_BIN="$(find_python)" || PYTHON_BIN=""
+
+# Where --out-of-tree stages the binaries. Outside the repository on
+# purpose: the whole point is to run them where nothing restricts them.
+TMPDIR_RUN="${TMPDIR_RUN:-${TEMP:-${TMPDIR:-/tmp}}/pdflib-run}"
 
 # --- per-architecture driver ----------------------------------------
 # Returns 0 only when every step of this architecture passed. The caller
@@ -142,19 +156,36 @@ run_arch() {
         STEP_FAIL=1
     fi
 
-    # 4) export table vs pdflib.def -----------------------------------
+    # 4) export tables vs the .def files -------------------------------
     # This is the guard against a decorated or missing export, which
-    # would break every GetProcAddress / ctypes / P-Invoke caller.
-    echo "[$ARCH] [4/5] export table"
-    local DLL="$BUILD/pdflib.dll"
-    local EXPORTS="$LOGDIR_REL/exports-$ARCH.txt"
+    # would break every GetProcAddress / ctypes / P-Invoke caller. pdfx
+    # matters most on x86, where __declspec(dllexport) would have added
+    # the "@N" stdcall decoration; its exports come from the .def file
+    # only, so this check is what proves the scheme works.
+    echo "[$ARCH] [4/5] export tables"
     if [ -n "${DUMPBIN_EXE:-}" ] && [ -x "$DUMPBIN_EXE" ]; then
+        local DLL="$BUILD/pdflib.dll"
+        local EXPORTS="$LOGDIR_REL/exports-$ARCH.txt"
         "$DUMPBIN_EXE" /exports "$DLL" > "$EXPORTS" 2>&1
         if "$PYTHON_BIN" tools/check_exports.py "$EXPORTS" src/pdflib.def; then
             :
         else
-            echo "[$ARCH] [FAIL] export table does not match src/pdflib.def"
+            echo "[$ARCH] [FAIL] pdflib export table does not match src/pdflib.def"
             STEP_FAIL=1
+        fi
+
+        local XDLL="$BUILD/pdfx.dll"
+        local XEXPORTS="$LOGDIR_REL/exports-pdfx-$ARCH.txt"
+        if [ -f "$XDLL" ]; then
+            "$DUMPBIN_EXE" /exports "$XDLL" > "$XEXPORTS" 2>&1
+            if "$PYTHON_BIN" tools/check_exports.py "$XEXPORTS" pdfx/pdfx.def; then
+                :
+            else
+                echo "[$ARCH] [FAIL] pdfx export table does not match pdfx/pdfx.def"
+                STEP_FAIL=1
+            fi
+        else
+            echo "[$ARCH] [skip] pdfx.dll not built"
         fi
     else
         echo "[$ARCH] [skip] dumpbin not available; export check skipped"
@@ -172,7 +203,20 @@ run_arch() {
     fi
 
     echo "[$ARCH] ctest"
-    if ! ctest --test-dir "$BUILD" --output-on-failure >> "$LOG" 2>&1; then
+    if [ "$OUT_OF_TREE" = "1" ] && [ -z "$PYTHON_BIN" ]; then
+        echo "[$ARCH] [FAIL] --out-of-tree needs a python interpreter"
+        STEP_FAIL=1
+    elif [ "$OUT_OF_TREE" = "1" ]; then
+        if ! "$PYTHON_BIN" tools/run_tests_out_of_tree.py \
+                --build-dir "$BUILD" --dest "$TMPDIR_RUN/$ARCH" \
+                >> "$LOG" 2>&1; then
+            echo "[$ARCH] [FAIL] out-of-tree test run - see $LOG"
+            grep -aE "\[FAIL\]|=== FAILED" "$LOG" | tail -20
+            STEP_FAIL=1
+        else
+            grep -aE "=== all .* test" "$LOG" | tail -1
+        fi
+    elif ! ctest --test-dir "$BUILD" --output-on-failure >> "$LOG" 2>&1; then
         echo "[$ARCH] [FAIL] ctest - see $LOG"
         grep -aE "Failed|FAILED|\*\*\*" "$LOG" | head -20
         STEP_FAIL=1
