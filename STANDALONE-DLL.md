@@ -289,7 +289,13 @@ knowing before you pick a backend:
 | `.ttc` collection, not embedded | works | rejects |
 | a page with nothing drawn on it | omits `/Contents` altogether | writes `/Length 0` + `/Filter [ /FlateDecode ]` |
 
-That last row is not a defect in either engine — both files are valid — but it
+The first row is a difference in *shape*, not in support: both engines stream and
+neither holds the serialized document, so an unbounded page count works on either.
+What differs is whether pages are released as they go. If you are writing a print
+driver where a 5000-page job must not grow the process, pick PoDoFo; if you only
+need the output to not be buffered, either will do and the code is identical.
+
+The last row is not a defect in either engine — both files are valid — but it
 trips up anything that reads a PDF back. A page whose only content is an
 annotation is *legitimately* blank, and it is represented two different ways.
 Any reader must treat a zero-length stream as decoding to zero bytes rather than
