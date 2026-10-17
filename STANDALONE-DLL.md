@@ -578,6 +578,54 @@ PDFX_Free(pdf);
 produces the same document either way: the showcase's two outputs match
 page for page.
 
+#### Selecting the engine: three things that are easy to get wrong
+
+**1. Call `PDFX_SetBackend` before the first `PDFX_New`.** The selection is
+process-wide, and each document binds to whatever engine is active when it is
+created — `PDFX_New` materialises a real document immediately. Setting the
+backend after `New` only affects documents created later, not the one you just
+built.
+
+```c
+PDFX_SetBackend(PDFLIB_PDFX_BACKEND_PODOFO);  /* first */
+PDFX_Doc doc = PDFX_New(NULL, NULL);          /* then */
+```
+
+**2. `PDFLIB_BACKEND` overrides the code.** If that environment variable is set,
+the first `PDFX_New` applies it and *overwrites* whatever `PDFX_SetBackend` set
+earlier in the process. It is applied exactly once, so a later `SetBackend` wins
+again. This exists so a shipped binary can be switched without a rebuild — but it
+means "I set PoDoFo in code and still got libharu" has one specific cause.
+
+**3. Under `AUTO`, `PDFX_GetBackendName()` returns `"auto"`, not the engine that
+actually ran.** `AUTO` prefers PoDoFo, then libharu. To report the real engine,
+use `PDFX_GetBackendVersion()`, which returns the engine's own version string
+(`"0.9.7"` or `"2.4.4"`).
+
+`PDFX_SetBackend` rejects an id that is not compiled in with
+`PDFX_INVALID_PARAMETER` (0x1039) rather than silently doing nothing.
+
+#### Migrating a libharu program
+
+The rename is mechanical and the shape is preserved, so a libharu source file
+converts in four steps:
+
+1. `#include "hpdf.h"` → `#include "pdfx.h"`
+2. `HPDF_` → `PDFX_` everywhere — functions, types (`HPDF_Doc` → `PDFX_Doc`),
+   and constants (`HPDF_PAGE_SIZE_A4` → `PDFX_PAGE_SIZE_A4`). A plain
+   `sed 's/HPDF_/PDFX_/g'` does the whole job.
+3. Link `pdfx.lib` instead of libharu's `hpdf.lib`, and ship `pdfx.dll` next to
+   the binary. Nothing else is needed: libharu is compiled into `pdfx.dll`, so
+   `hpdf.dll`/`hpdf.lib` can be deleted.
+4. Re-check anything that passes **text**. `PDFX_*` takes UTF-8, not the
+   encoded byte strings `HPDF_*` accepted; a GBK or Shift-JIS buffer will not
+   render. This is the only source-level contract that changes.
+
+`HPDF_NewDoc(pdf)` can stay. libharu programs almost always call it, and here it
+returns `PDFX_OK` without creating a second document — `PDFX_New` already did
+that. The error handler keeps its signature (`__stdcall`, three arguments), so
+existing callbacks only need the type renamed.
+
 ### It is a separate, self-contained DLL
 
 `pdfx.dll` does not depend on `pdflib.dll`. It carries its own copy of the
