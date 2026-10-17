@@ -150,6 +150,12 @@ static pdf_status check_doc_live(pdf_doc doc)
         return rc;
     if (doc->stream_error != PDF_OK)
         return doc->stream_error; /* torn output: report the real cause */
+    /* A finished streamed document has already pushed its trailer: adding
+     * a page or loading a font afterwards cannot reach the output, so
+     * accepting it would be the "returns PDF_OK and does nothing" failure
+     * this library is built to avoid. Say so instead. */
+    if (doc->streamed && doc->finished)
+        return PDF_ERR_INVALID_STATE;
     return PDF_OK;
 }
 

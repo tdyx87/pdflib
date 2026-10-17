@@ -19,7 +19,7 @@
  *
  * Produces  <prefix>.pdf                 the main document (8 pages)
  *           <prefix>-encrypted.pdf       same, RC4-128 + permissions
- *           <prefix>-streamed.pdf        incremental writer (PoDoFo only)
+ *           <prefix>-streamed.pdf        incremental writer (both engines)
  *
  * Exit status is non-zero if any assertion fails, so ctest can run it.
  * ==================================================================== */
@@ -1702,16 +1702,16 @@ static int build_showcase(pdf_backend backend, const char *name,
     OK(pdf_doc_save_to_file(b.doc, path), "showcase: save_to_file");
     printf("  [i]    wrote %s\n", path);
 
-    /* The streamed writer, where the engine has one. */
+    /* The streamed writer. Both engines implement it, so declining is a
+     * regression, not a capability gap: assert success rather than passing
+     * quietly, otherwise a backend that stops streaming goes unnoticed. */
     if (streamed_path)
     {
         pdf_doc sdoc = NULL;
         pdf_status st = pdf_doc_create_streamed_to_file(streamed_path, &sdoc);
-        if (st == PDF_ERR_BACKEND_UNSUPPORTED)
-        {
-            check(1, "showcase: streamed writer not supported by this engine");
-        }
-        else if (st == PDF_OK && sdoc)
+        check(st == PDF_OK && sdoc != NULL,
+              "showcase: create_streamed_to_file (got %d)", (int)st);
+        if (st == PDF_OK && sdoc)
         {
             pdf_page sp = NULL;
             pdf_font f = NULL;
@@ -2314,6 +2314,97 @@ static int build_encrypted(pdf_backend backend, const char *path)
 /* Driver                                                               */
 /* ==================================================================== */
 
+/* The streamed file is a *separate* document, so verify_showcase cannot be
+ * reused: that one asserts the 13-page layout. What matters here is that the
+ * bytes the incremental writer produced are a real PDF - every page present,
+ * its text drawn exactly once, the metadata that was set before any page
+ * survived, and every stream still inflatable. Without this the streamed path
+ * is only exercised, never checked, and a writer that emitted a valid header
+ * plus nothing else would pass. */
+static void verify_streamed(const char *path, const char *label)
+{
+    reader r;
+    int i;
+    const int pages = 4;
+
+    printf("\n[test] read-back verification (%s, streamed)\n", label);
+
+    if (!reader_open(&r, path))
+        return;
+
+    {
+        long nums[PDFI_MAX_PAGES];
+        int np = pdfi_pages(r.d, nums, PDFI_MAX_PAGES);
+        check(np == pages, "%s streamed: page count is %d (got %d)",
+              label, pages, np);
+    }
+
+    for (i = 0; i < pages; i++)
+    {
+        unsigned char *c = NULL;
+        long n = reader_page_content(&r, i, &c);
+        char want[64];
+
+        snprintf(want, sizeof(want), "streamed sheet %d - page %d of 4",
+                 i + 1, i + 1);
+        if (n <= 0)
+        {
+            check(0, "%s streamed: page %d has no content", label, i + 1);
+            free(c);
+            continue;
+        }
+        check(pdfi_count_text(c, n, want) == 1,
+              "%s streamed: page %d draws \"%s\" exactly once", label, i + 1,
+              want);
+        free(c);
+    }
+
+    /* Every stream must inflate: a mis-sized /Length leaves a perfect page
+     * tree, so this is the only check that catches a truncated write. */
+    {
+        int k, bad = 0, checked = 0;
+
+        for (k = 0; k < r.d->nobj; k++)
+        {
+            const pdfi_obj *o = &r.d->objs[k];
+            unsigned char *dec = NULL;
+            long len;
+
+            if (o->stream_off < 0 || o->stream_len <= 0)
+                continue;
+            if (!pdfi_stream_is_flate(r.d, o))
+            {
+                char filters[4][48];
+
+                if (pdfi_stream_filters(r.d, o, filters, 4) > 0)
+                    continue;
+            }
+            checked++;
+            len = pdfi_stream(r.d, o, &dec);
+            if (len < 0)
+                bad++;
+            free(dec);
+        }
+        check(checked > 0 && bad == 0,
+              "%s streamed: all %d stream(s) decode (0 failures)", label,
+              checked);
+    }
+
+    {
+        long info = pdfi_trailer_ref(r.d, "Info");
+        const pdfi_obj *o = info > 0 ? pdfi_find(r.d, info) : NULL;
+        char v[256] = "";
+
+        check(o != NULL, "%s streamed: trailer has an /Info dictionary", label);
+        if (o)
+            check(pdfi_dict_text(r.d, o, "Title", v, sizeof(v)) &&
+                      strcmp(v, "pdflib showcase (streamed)") == 0,
+                  "%s streamed: /Title round-trips as \"%s\"", label, v);
+    }
+
+    reader_close(&r);
+}
+
 static int run_one(pdf_backend backend, const char *name, const char *prefix)
 {
     char path[512], enc[512], streamed[512];
@@ -2327,6 +2418,7 @@ static int run_one(pdf_backend backend, const char *name, const char *prefix)
         return 1;
 
     verify_showcase(path, name, faces);
+    verify_streamed(streamed, name);
 
     if (backend == PDF_BACKEND_PODOFO)
         build_encrypted(backend, enc);

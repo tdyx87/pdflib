@@ -187,8 +187,9 @@ target_link_libraries(app PRIVATE hpdf)   # hpdf 已 PUBLIC 链接 pdflib
    `HPDF_GetFont(pdf, 返回的名字, ...)` 取回。libharu 后端不支持
    `embed=0`，PoDoFo 支持。
 6. **流式文档**：libharu 兼容层总是创建普通（内存）文档；`HPDF_SaveToStream`
-   是内存流，不是 pdflib 的 `pdf_doc_create_streamed` 原生流式。需要
-   O(1) 页内存时请使用原生 `pdf_*` API。
+   是内存流，不是 pdflib 的 `pdf_doc_create_streamed` 原生流式。需要边生成边
+   输出时请使用原生 `pdf_*` API（两个真实引擎都支持；PoDoFo 逐页 flush 并释放
+   页对象，libharu 在 `pdf_doc_finish` 时一次性序列化到 sink）。
 7. **加密**：libharu 兼容层只映射 RC4-40/RC4-128（`HPDF_ENCRYPT_R2/R3`）；
    是否真正加密取决于后端（PoDoFo 当前构建无 OpenSSL，会返回
    `HPDF_UNSUPPORTED_FUNC`；libharu 后端可用）。

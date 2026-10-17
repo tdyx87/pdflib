@@ -281,8 +281,11 @@ static void test_save_to_handle(void)
 
 static void test_streamed_document(int backend, const char *name)
 {
-    /* The flagship streaming path: page count unknown up front, memory
-     * bounded by one page. Only tested on a backend that supports it. */
+    /* The flagship streaming path: page count unknown up front, and the
+     * serialized document is never held in a buffer of its own. Both
+     * engines support it now - PoDoFo pushes each page as it completes,
+     * libharu serializes straight into the sink at finish - so the checks
+     * below are the same for both. */
     pdf_doc doc = NULL;
     sink_state s;
     int i, pages = 37;
@@ -300,9 +303,11 @@ static void test_streamed_document(int backend, const char *name)
     s.total = 0; s.calls = 0;
     CHECK(s.f != NULL, "open output");
 
+    /* Both real engines stream, so this is a hard requirement - only the
+     * marker backend declines. Soft-skipping here would let a regression
+     * through on the one test that consumes the DLL across CRT boundaries. */
     if (pdf_doc_create_streamed(sink_write, &s, &doc) != PDF_OK) {
-        printf("  [i]    streamed mode unsupported on %s (OK, caller falls back)\n",
-               name);
+        CHECK(0, "create_streamed (%s)", name);
         fclose(s.f);
         remove(path);
         return;
@@ -351,8 +356,7 @@ static void test_streamed_document_to_handle(int backend, const char *name)
     CHECK(h != NULL, "open output handle");
 
     if (pdf_doc_create_streamed_to_handle(h, &doc) != PDF_OK) {
-        printf("  [i]    streamed mode unsupported on %s (OK, caller falls back)\n",
-               name);
+        CHECK(0, "create_streamed_to_handle (%s)", name);
         os_close(h);
         remove(path);
         return;

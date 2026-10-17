@@ -1616,8 +1616,8 @@ static void test_error_paths(void)
         }
         else
         {
-            printf("  [i]    no streamed writer on this engine; "
-                   "streamed-reject checks skipped\n");
+            CHECK(0, "%s: streamed writer exists to test the refuse path",
+                  name);
         }
         remove("apitest-streamed-reject.pdf");
         remove("apitest-nope.pdf");
@@ -2373,7 +2373,23 @@ static void test_streamed(int backend, const char *name)
             pdf_page_draw_text(page, font, line, 60, 780, 14);
         }
         CHECK(pdf_doc_finish(doc) == PDF_OK, "streamed doc_finish");
-        CHECK(s.calls >= pages, "sink saw >= one chunk per page");
+        /* More than one chunk for a nine-page document is what separates
+         * a real streamed writer from the buffered fallback in the core
+         * (pdf_doc_save_to_stream's generic path pushes the whole file as
+         * a single chunk). If a future change routes this engine through
+         * that path, this is the check that notices. */
+        CHECK(s.calls >= pages,
+              "sink saw one chunk per page, not the whole file at once");
+        /* The trailer has been pushed: a page added now could not reach
+         * the output, so it has to be refused instead of accepted and
+         * silently dropped. */
+        {
+            pdf_page extra = NULL;
+
+            CHECK(pdf_page_add_custom(doc, 595, 842, &extra)
+                      == PDF_ERR_INVALID_STATE,
+                  "page_add after finish is refused");
+        }
         CHECK(pdf_doc_free(doc) == PDF_OK, "streamed doc_free");
         fclose(s.f);
 
@@ -2407,7 +2423,10 @@ static void test_streamed(int backend, const char *name)
         pdf_status rc = pdf_doc_create_streamed_to_file(path, &doc);
         if (rc == PDF_ERR_BACKEND_UNSUPPORTED)
         {
-            printf("  [i]    %s: create_streamed_to_file unsupported\n", name);
+            /* Both engines stream now, so declining is a regression rather
+             * than a capability gap. Failing here keeps the two checks below
+             * from silently disappearing. */
+            CHECK(0, "%s: create_streamed_to_file is supported", name);
             remove(path);
         }
         else
@@ -2453,7 +2472,7 @@ static void test_streamed(int backend, const char *name)
         rc = pdf_doc_create_streamed_to_handle(h, &doc);
         if (rc == PDF_ERR_BACKEND_UNSUPPORTED)
         {
-            printf("  [i]    %s: create_streamed_to_handle unsupported\n", name);
+            CHECK(0, "%s: create_streamed_to_handle is supported", name);
             os_close(h);
             remove(path);
         }
@@ -2501,19 +2520,35 @@ static void test_streamed(int backend, const char *name)
         {
             pdf_page page = NULL;
             pdf_font font = NULL;
+            pdf_status loop_rc = PDF_OK;
             pdf_status rc;
-            int got_error = 0;
 
             pdf_page_add_custom(doc, 595, 842, &page);
             pdf_font_get_std(doc, PDF_STD_FONT_HELVETICA, &font);
-            for (i = 0; i < 40 && !got_error; i++)
+            for (i = 0; i < 40; i++)
             {
                 pdf_page_draw_text(page, font, "boom", 60, 700, 14);
-                rc = pdf_page_add_custom(doc, 595, 842, &page);
-                if (rc == PDF_ERR_IO)
-                    got_error = 1;
+                loop_rc = pdf_page_add_custom(doc, 595, 842, &page);
+                if (loop_rc != PDF_OK)
+                    break;
             }
-            CHECK(got_error, "failing sink propagates PDF_ERR_IO");
+            /* Where the failure surfaces depends on the engine, and that
+             * is a property of the engine rather than a contract: PoDoFo
+             * pushes each page as it completes, so the very next
+             * page_add already sees the rejection; libharu can only
+             * serialize at finish, so nothing is written until then.
+             *
+             * What must hold on both is that the rejection is REPORTED.
+             * A sink that fails and a save that still returns PDF_OK is
+             * how a caller ends up shipping a truncated document. */
+            if (loop_rc != PDF_OK)
+                CHECK(loop_rc == PDF_ERR_IO,
+                      "failing sink reported during page_add");
+            else
+                printf("  [i]    %s: writes at finish, so the rejection "
+                       "surfaces there\n", name);
+            rc = pdf_doc_finish(doc);
+            CHECK(rc == PDF_ERR_IO, "failing sink surfaces as PDF_ERR_IO");
             CHECK(pdf_doc_finish(doc) == PDF_ERR_IO,
                   "finish keeps reporting the sink failure");
         }

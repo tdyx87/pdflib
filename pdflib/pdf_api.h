@@ -360,17 +360,35 @@ typedef pdf_status (*pdf_stream_write_fn)(const unsigned char *data,
  *          PDF_ERR_OUT_OF_MEMORY. */
 PDFAPI pdf_status pdf_doc_create(pdf_doc *out_doc);
 
-/** Create a streaming document: output is written to the callback as pages
- *  complete, so total page count and content may be unknown up front
- *  (e.g. a printer driver translating a spool job). Memory use stays
- *  bounded by one page's objects, not the whole document.
+/** Create a streaming document: output is written to the callback as the
+ *  document is serialized, so total page count and content may be unknown
+ *  up front (e.g. a printer driver translating a spool job). The
+ *  serialized document is never buffered in full.
+ *
+ *  Both engines support this, but they stream at different points, and the
+ *  difference is visible to a caller that watches the sink:
+ *
+ *    - PoDoFo (PdfStreamedDocument) pushes each page as it is completed
+ *      and releases it, so memory stays bounded by one page's objects and
+ *      a rejected sink is reported by the next page_add.
+ *    - libharu builds its object graph in memory and can only emit it
+ *      once, at finish. Nothing reaches the sink before then, and a
+ *      rejected sink is reported by pdf_doc_finish. The object graph is
+ *      still held, but the serialized bytes are not, which is what makes
+ *      the output unbounded in size.
+ *
+ *  In both cases a sink failure is reported, never swallowed - only where
+ *  it surfaces differs.
  *
  *  Streaming documents are written implicitly; pdf_doc_save_to_*() is
- *  rejected on them. Call pdf_doc_finish() to flush (pending font subsets
- *  are embedded at that point); pdf_doc_free() finishes automatically.
+ *  rejected on them, and so is adding anything after pdf_doc_finish()
+ *  (PDF_ERR_INVALID_STATE) because it could no longer reach the output.
+ *  Call pdf_doc_finish() to flush (pending font subsets are embedded at
+ *  that point); pdf_doc_free() finishes automatically.
  *
  *  @return PDF_OK, PDF_ERR_INVALID_PARAM or PDF_ERR_BACKEND_UNSUPPORTED
- *          (engine cannot stream; use pdf_doc_create + save_to_stream). */
+ *          (the engine has no writer at all; use pdf_doc_create +
+ *          save_to_stream). */
 PDFAPI pdf_status pdf_doc_create_streamed(pdf_stream_write_fn write_fn,
                                           void *userdata, pdf_doc *out_doc);
 

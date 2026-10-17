@@ -425,8 +425,10 @@ Byte-level assertions adapt to each engine's documented output shape:
   `PdfPage` wrapper returned by `CreatePage` becomes dangling once
   another page is created — the backend resolves pages by index through
   `GetPage()` instead.
-- libharu has no streamed writer (the suite reports `SKIP`), requires
-  the encrypt-dict to be created via `HPDF_SetPassword` before
+- libharu streams through a callback-backed `HPDF_Stream` rather than an
+  incremental writer, so its bytes reach the sink at `pdf_doc_finish`
+  instead of per page. It requires the encrypt-dict to be created via
+  `HPDF_SetPassword` before
   mode/permission calls (the adapter orders them correctly), and has no
   public API to write a trailer `/ID` — the suite notes this upstream
   limitation instead of failing.

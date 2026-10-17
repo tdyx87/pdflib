@@ -698,7 +698,9 @@ static void test_streamed_with_images(void)
     buf_init(&b);
     if (pdf_doc_create_streamed(sink_write, &b, &doc) != PDF_OK)
     {
-        /* Backend has no streamed writer (e.g. libharu). */
+        /* Both real engines stream; only the marker backend has no writer.
+         * apitest and the showcase assert this hard - this file just skips
+         * so it can also run against the dummy backend. */
         printf("  SKIP: no streamed writer on this backend\n");
         skipped++;
         return;

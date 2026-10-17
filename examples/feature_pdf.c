@@ -207,7 +207,7 @@ int main(int argc, char **argv)
     }
 
     /* 0) streamed creation with unknown page count (printer driver path).
-     *    podofo supports it natively; other engines report UNSUPPORTED. */
+     *    Both real engines support it; only the marker backend declines. */
     {
         pdf_doc probe = NULL;
         pdf_status rc = pdf_doc_create_streamed_to_file("feature-probe.pdf",

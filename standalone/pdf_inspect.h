@@ -1860,6 +1860,104 @@ static long pdfi_trailer_ref(const pdfi_doc *d, const char *key)
     return -1;
 }
 
+/* Decode the byte escapes of every literal string in a content stream,
+ * leaving everything else exactly as it was.
+ *
+ * Matching a needle against raw stream bytes tests how the WRITER chose to
+ * spell a string, not what the string says. libharu escapes every byte
+ * outside a small safe set, so "sheet 1/9" reaches the file as
+ * "(sheet 1\0579)"; PoDoFo writes the slash as it is. Both are legal - the
+ * spec only requires ( ) and \ to be escaped - so a reader that compares
+ * raw bytes is measuring the engine, not the document. That is exactly how
+ * this was noticed: the same nine pages, drawn by the same code, matched
+ * their text on one engine and not on the other.
+ *
+ * Only bytes inside literal strings are decoded; hex strings, names,
+ * numbers, operators and comments are copied verbatim, so the existing
+ * literal-or-hex search still sees both spellings.
+ *
+ * Returns a malloc'd buffer of at most `n` bytes and sets *out_n, or NULL
+ * when the allocation fails - callers then fall back to the raw bytes. */
+static unsigned char *pdfi_normalize_literals(const unsigned char *c, long n,
+                                              long *out_n)
+{
+    unsigned char *dst = (unsigned char *)malloc((size_t)n + 1);
+    long r = 0;
+    long w = 0;
+    int depth = 0; /* paren nesting inside a literal string */
+
+    if (!dst)
+        return NULL;
+
+    while (r < n)
+    {
+        int ch = c[r];
+
+        if (depth == 0)
+        {
+            if (ch == '%')
+            {
+                /* A comment runs to the end of the line and may legally
+                 * contain unbalanced parentheses, so it is copied whole. */
+                while (r < n && c[r] != '\n' && c[r] != '\r')
+                    dst[w++] = c[r++];
+                continue;
+            }
+            if (ch == '(')
+                depth = 1;
+            dst[w++] = (unsigned char)ch;
+            r++;
+            continue;
+        }
+
+        if (ch == '\\' && r + 1 < n)
+        {
+            int e = c[r + 1];
+
+            r += 2;
+            switch (e)
+            {
+                case 'n': dst[w++] = '\n'; break;
+                case 'r': dst[w++] = '\r'; break;
+                case 't': dst[w++] = '\t'; break;
+                case 'b': dst[w++] = '\b'; break;
+                case 'f': dst[w++] = '\f'; break;
+                case '\r': /* line continuation: contributes nothing */
+                    if (r < n && c[r] == '\n')
+                        r++;
+                    break;
+                case '\n':
+                    break;
+                default:
+                    if (e >= '0' && e <= '7')
+                    {
+                        int oct = e - '0';
+                        int k;
+
+                        for (k = 0; k < 2 && r < n && c[r] >= '0' &&
+                                    c[r] <= '7'; k++)
+                            oct = oct * 8 + (c[r++] - '0');
+                        dst[w++] = (unsigned char)(oct & 0xff);
+                    }
+                    else
+                        dst[w++] = (unsigned char)e; /* \( \) \\ and the rest */
+                    break;
+            }
+            continue;
+        }
+        if (ch == '(')
+            depth++;
+        else if (ch == ')')
+            depth--;
+        dst[w++] = (unsigned char)ch;
+        r++;
+    }
+
+    dst[w] = 0;
+    *out_n = w;
+    return dst;
+}
+
 /* Does a drawn text string appear in a decoded content stream?
  *
  * A text-showing operator carries the text in one of two shapes and the
@@ -1880,27 +1978,39 @@ static int pdfi_content_has_text(const unsigned char *c, long n,
     char up[512], lo[512];
     size_t len = strlen(text);
     size_t i;
+    long nn = 0;
+    unsigned char *norm = pdfi_normalize_literals(c, n, &nn);
+    const unsigned char *s = norm ? norm : c;
+    long sn = norm ? nn : n;
+    int hit = 0;
 
     if (len == 0)
-        return 1;
-    if (pdfi_contains(c, n, text))
-        return 1;
-    if (len * 2 + 1 > sizeof(up))
-        return 0;
-
-    for (i = 0; i < len; i++)
     {
-        unsigned char b = (unsigned char)text[i];
-
-        up[i * 2] = hexd[b >> 4];
-        up[i * 2 + 1] = hexd[b & 0x0f];
-        lo[i * 2] = hexl[b >> 4];
-        lo[i * 2 + 1] = hexl[b & 0x0f];
+        free(norm);
+        return 1;
     }
-    up[len * 2] = 0;
-    lo[len * 2] = 0;
+    if (pdfi_contains(s, sn, text))
+    {
+        free(norm);
+        return 1;
+    }
+    if (len * 2 + 1 <= sizeof(up))
+    {
+        for (i = 0; i < len; i++)
+        {
+            unsigned char b = (unsigned char)text[i];
 
-    return pdfi_contains(c, n, up) || pdfi_contains(c, n, lo);
+            up[i * 2] = hexd[b >> 4];
+            up[i * 2 + 1] = hexd[b & 0x0f];
+            lo[i * 2] = hexl[b >> 4];
+            lo[i * 2 + 1] = hexl[b & 0x0f];
+        }
+        up[len * 2] = 0;
+        lo[len * 2] = 0;
+        hit = pdfi_contains(s, sn, up) || pdfi_contains(s, sn, lo);
+    }
+    free(norm);
+    return hit;
 }
 
 /* How many times does a drawn text string appear in a decoded content
@@ -1923,14 +2033,29 @@ static int pdfi_count_text(const unsigned char *c, long n, const char *text)
     char up[512];
     size_t len = strlen(text);
     size_t i;
+    long nn = 0;
+    unsigned char *norm;
+    const unsigned char *s;
+    long sn;
     int lit, hex;
 
     if (len == 0)
         return 0;
 
-    lit = pdfi_count_plain(c, n, text);
+    /* Escapes are decoded first, for the reason pdfi_normalize_literals
+     * documents: the writer's spelling of a literal string is not the
+     * document's content, and counting must not depend on which engine
+     * wrote it. */
+    norm = pdfi_normalize_literals(c, n, &nn);
+    s = norm ? norm : c;
+    sn = norm ? nn : n;
+
+    lit = pdfi_count_plain(s, sn, text);
     if (len * 2 + 1 > sizeof(up))
+    {
+        free(norm);
         return lit;
+    }
 
     for (i = 0; i < len; i++)
     {
@@ -1940,7 +2065,8 @@ static int pdfi_count_text(const unsigned char *c, long n, const char *text)
         up[i * 2 + 1] = hexd[b & 0x0f];
     }
     up[len * 2] = 0;
-    hex = pdfi_count_plain(c, n, up);
+    hex = pdfi_count_plain(s, sn, up);
+    free(norm);
 
     return hex > lit ? hex : lit;
 }

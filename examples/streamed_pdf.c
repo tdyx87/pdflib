@@ -9,16 +9,18 @@
  * complete and the total page count is never held in memory.
  *
  * Streaming creation is mandatory here, so the example refuses to fall
- * back to the buffered API. libharu (and the dummy marker backend) have
- * no streamed writer and report PDF_ERR_BACKEND_UNSUPPORTED; when that
- * happens this example automatically switches to PoDoFo, which streams
- * natively. If PoDoFo is not compiled in either, the example fails.
+ * back to the buffered API. Both real engines stream - PoDoFo through its
+ * native incremental writer, libharu by pointing its serializer at a
+ * callback stream - but the marker backend (PDF_BACKEND_DUMMY) has no
+ * writer and reports PDF_ERR_BACKEND_UNSUPPORTED. When that happens this
+ * example automatically switches to PoDoFo. If PoDoFo is not compiled in
+ * either, the example fails.
  *
  *   streamed_pdf <out.pdf> [podofo|libharu|dummy]
  *
  * With no backend argument the default (PDF_BACKEND_AUTO) is used. The
  * example prints the engine that actually produced the file, so passing
- * "libharu" demonstrates the automatic switch to PoDoFo.
+ * "dummy" demonstrates the automatic switch to PoDoFo.
  */
 
 /* Collect a short summary of the streamed output as it is written. */

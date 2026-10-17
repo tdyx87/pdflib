@@ -47,7 +47,7 @@ Python, .NET, Java, Go, Rust, Node.js, Delphi, VB6/VBA, PowerBuilder, C/C++ itse
 | Area | What you get |
 |------|--------------|
 | Documents | create in memory, save to file / memory buffer / **stream callback** / **OS handle** |
-| **Streaming** | **unknown page count**, memory bounded to ~one page (`pdf_doc_create_streamed`) |
+| **Streaming** | **unknown page count**, output never buffered in full (`pdf_doc_create_streamed`) — one page in flight on PoDoFo, the object graph on libharu |
 | Pages | 7 standard sizes + custom sizes, rotation, page count |
 | Fonts | 14 standard fonts, TrueType from **file / memory / system**, **`.ttc` collections unwrapped automatically**, subset embedding, text metrics (width / ascent / descent) |
 | Text | single line, aligned, and word-wrapped paragraphs |
@@ -284,7 +284,7 @@ knowing before you pick a backend:
 
 | Situation | PoDoFo | libharu |
 |-------|--------|---------|
-| `pdf_doc_create_streamed` | native, O(1) per page | `PDF_ERR_BACKEND_UNSUPPORTED` |
+| `pdf_doc_create_streamed` | native incremental writer, one page in flight, bytes reach the sink per page | supported, but serializes at `pdf_doc_finish`, so bytes reach the sink in one run |
 | `.ttc` collection, embedded | loads (the core unwraps face 0); drawing a subsetted collection face can fail with `PDF_ERR_BACKEND_FAILED` | rejects with `PDF_ERR_BACKEND_FAILED` |
 | `.ttc` collection, not embedded | works | rejects |
 | a page with nothing drawn on it | omits `/Contents` altogether | writes `/Length 0` + `/Filter [ /FlateDecode ]` |
@@ -320,11 +320,13 @@ pdflib_set_backend(PDF_BACKEND_LIBHARU);  /* 2 */
 ```
 
 - **`PDF_BACKEND_AUTO` (0)** — prefers PoDoFo, then libharu.
-- **PoDoFo** implements **native streaming** — the recommended engine for
-  print-driver style work with unbounded page counts.
-- **libharu** always embeds TrueType fonts and has no streamed writer (it reports
-  `PDF_ERR_BACKEND_UNSUPPORTED` for `pdf_doc_create_streamed`), but it is the more
-  battle-tested renderer for ordinary text/graphics.
+- **PoDoFo** has a **native incremental writer**, so streamed output flushes page by
+  page and releases each page's objects — the better choice for print-driver style
+  work with unbounded page counts.
+- **libharu** also streams (through a callback-backed `HPDF_Stream`), but it
+  serializes the object graph at `pdf_doc_finish` — the output is still never
+  buffered, only the flush point differs. It always embeds TrueType fonts and is
+  the more battle-tested renderer for ordinary text/graphics.
 
 Note the five names that are prefixed `pdflib_` rather than `pdf_` — they sit beside
 the backend table itself and were named this way upstream:
@@ -451,17 +453,37 @@ pdf_doc_free(doc);
 
 Contract:
 
-- Peak memory stays **O(1) per page** — content is flushed as each page completes, not
-  buffered for the whole document.
+- The serialized document is **never buffered in full** — output goes to the sink as the
+  engine produces it, so the document may be larger than memory.
 - If the sink fails (disk full, peer gone), its error propagates verbatim and the
   document is **poisoned**: every later call fails fast with the same code and no
   further bytes are delivered. A half-written target file is removed.
 - On a streamed document the `pdf_doc_save_to_*` calls return
-  `PDF_ERR_INVALID_STATE` — output is already flowing.
+  `PDF_ERR_INVALID_STATE` — output is already flowing. So does adding a page after
+  `pdf_doc_finish`, because the trailer has been written and the page could not
+  reach the output.
 
-If the engine cannot stream (libharu), `pdf_doc_create_streamed` returns
-`PDF_ERR_BACKEND_UNSUPPORTED` so the caller can fall back to
-`pdf_doc_create` + `pdf_doc_save_to_stream`.
+Both engines stream, but **at different points**, and that is the one place the
+engines are not interchangeable:
+
+| | PoDoFo (`PdfStreamedDocument`) | libharu |
+|---|---|---|
+| when bytes reach the sink | as each page completes | at `pdf_doc_finish` |
+| memory held | one page's objects | the object graph (never the serialized bytes) |
+| where a sink failure surfaces | the next `page_add` | `pdf_doc_finish` |
+
+libharu has no incremental writer, so the adapter points the serializer at a
+callback-backed `HPDF_Stream` (`HPDF_CallbackWriter_New`): `HPDF_SaveToStream`
+writes objects sequentially and never seeks, so everything it produces goes
+straight to the sink. That is what makes the output unbounded in size on both
+engines; only PoDoFo also releases pages as it goes. A caller that needs
+per-page flushing should select PoDoFo — but no caller has to branch to *use*
+the API.
+
+`pdf_doc_create_streamed` still returns `PDF_ERR_BACKEND_UNSUPPORTED` when a
+backend has no writer at all (a future engine that declines to implement
+`doc_create_streamed`), so a caller can fall back to `pdf_doc_create` +
+`pdf_doc_save_to_stream`.
 
 ## Backends & status codes
 

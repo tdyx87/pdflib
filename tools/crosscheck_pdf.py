@@ -14,12 +14,14 @@ that is structurally perfect and visually empty.
 
     python tools/crosscheck_pdf.py FILE [FILE...] [--render DIR]
     python tools/crosscheck_pdf.py --profile pdfx pdfx-showcase-*.pdf
+    python tools/crosscheck_pdf.py --profile streamed *-streamed.pdf
 
-`--profile` picks which document to expect. Both profiles do the same
-kind of work; they differ only in the pages, text and metadata the
-document is supposed to have. The pdfx profile additionally asserts that
+`--profile` picks which document to expect. All profiles do the same kind
+of work; they differ only in the pages, text and metadata the document is
+supposed to have. The pdfx and streamed profiles additionally assert that
 MuPDF did not have to repair the file, because a content stream that does
-not decode still opens - it just opens wrong.
+not decode, or an xref written out of order, still opens - it just opens
+wrong.
 
 Exit status is non-zero on any mismatch. If PyMuPDF is not installed the
 script says so and exits 0, so it can sit in a test suite that must also
@@ -110,6 +112,52 @@ def check_markup_annotations(doc, page, page_label, name, problems):
                   "%s: %s has a sane rectangle (%s)" %
                   (name, a.type[1], r))
     return annots
+
+
+def check_streamed(path, problems, render_dir):
+    """Cross-check a document written through the streamed API.
+
+    The streamed path is a separate writer in both engines - PoDoFo has
+    PdfStreamedDocument, libharu serializes straight into the sink - so it
+    gets its own expectations rather than inheriting confidence from the
+    batch document. The showcase writes four A4 pages with a heading and a
+    filled rectangle on each.
+    """
+    import pymupdf
+
+    name = os.path.basename(path)
+    print("\n=== %s (independent parser: PyMuPDF %s) ===" %
+          (name, pymupdf.__doc__ or pymupdf.version[0]))
+
+    try:
+        doc = pymupdf.open(path)
+    except Exception as exc:                       # noqa: BLE001
+        fail(problems, "%s: cannot open: %s" % (name, exc))
+        return
+
+    check(problems, not doc.is_encrypted, "%s: opens unencrypted" % name)
+    # The xref and trailer are the last thing a streamed writer emits, so
+    # a truncated or mis-ordered stream shows up here before anywhere else.
+    check(problems, not doc.is_repaired,
+          "%s: MuPDF did not have to repair the file" % name)
+    check(problems, doc.page_count == 4,
+          "%s: page count is 4 (got %d)" % (name, doc.page_count))
+
+    for i in range(doc.page_count):
+        mb = doc[i].mediabox
+        check(problems, abs(mb.width - 595) < 2 and abs(mb.height - 842) < 2,
+              "%s: page %d is A4 portrait (%.0fx%.0f)" %
+              (name, i + 1, mb.width, mb.height))
+        want = "streamed sheet %d - page %d of 4" % (i + 1, i + 1)
+        check(problems, want in doc[i].get_text(),
+              "%s: page %d carries %r" % (name, i + 1, want))
+
+    md = doc.metadata or {}
+    check(problems, md.get("title") == "pdflib showcase (streamed)",
+          "%s: /Title is %r" % (name, md.get("title")))
+
+    render_pages(doc, name, problems, render_dir)
+    doc.close()
 
 
 def check_pdfx_showcase(path, problems, render_dir):
@@ -428,10 +476,11 @@ def main():
     ap.add_argument("files", nargs="+", help="PDF files to cross-check")
     ap.add_argument("--render", metavar="DIR",
                     help="render every page to DIR as PNG")
-    ap.add_argument("--profile", choices=("showcase", "pdfx"),
+    ap.add_argument("--profile", choices=("showcase", "pdfx", "streamed"),
                     default="showcase",
                     help="which document to expect: the pdflib showcase "
-                         "(default) or the pdfx (libharu-style API) showcase")
+                         "(default), the pdfx (libharu-style API) showcase, "
+                         "or the streamed-API document")
     ap.add_argument("--pages", type=int, default=8,
                     help="expected page count for a showcase document")
     args = ap.parse_args()
@@ -450,6 +499,8 @@ def main():
             continue
         if args.profile == "pdfx":
             check_pdfx_showcase(path, problems, args.render)
+        elif args.profile == "streamed":
+            check_streamed(path, problems, args.render)
         else:
             check_showcase(path, problems, args.render,
                            {"pages": args.pages})

@@ -9,6 +9,15 @@
 #include "pdf_internal.h"
 
 #include <hpdf.h>
+/* hpdf.h stops at the public surface, but streamed output needs two things
+ * that only the internal headers expose: HPDF_Doc's `stream` member (so the
+ * serializer can be pointed at a callback) and HPDF_CallbackWriter_New (the
+ * stream type whose write_fn is a plain function pointer). Both are
+ * installed by the libharu package and are part of the pinned version this
+ * adapter is built against, so this is a compile-time dependency, not a
+ * runtime guess. */
+#include <hpdf_doc.h>
+#include <hpdf_streams.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,6 +39,20 @@ typedef struct haru_doc
      * and libharu's error state is sticky -- every later call that routes
      * through HPDF_HasDoc fails with HPDF_INVALID_DOCUMENT. */
     size_t page_count;
+
+    /* Streamed output (h_doc_create_streamed).
+     *
+     * The serializer is pointed at a callback-backed stream, so the
+     * document is never serialized into a buffer of its own; the sink is
+     * called with whatever libharu writes next. sink_status latches the
+     * first failure because HPDF_SaveToStream() reports the DOCUMENT's
+     * error, and a rejected write only sets that if the write function
+     * raised one - the sink's own status has to survive on its own. */
+    int streamed;
+    int finished;
+    pdf_stream_write_fn sink_write;
+    void *sink_user;
+    pdf_status sink_status;
 } haru_doc;
 
 typedef struct haru_page
@@ -291,6 +314,111 @@ static void h_doc_free(pdf_backend_doc *doc)
     if (d->pdf)
         HPDF_Free(d->pdf);
     free(d);
+}
+
+/* ----- streamed output ---------------------------------------------------- */
+
+/* libharu has no incremental writer, but it has the two pieces needed to
+ * build one, and this is what makes pdf_doc_create_streamed* work on this
+ * engine instead of returning PDF_ERR_BACKEND_UNSUPPORTED.
+ *
+ * HPDF_SaveToStream() serializes the document into pdf->stream, writing
+ * objects one after another and never seeking: the byte order it produces
+ * is already the byte order of a file. What it writes to is just a stream,
+ * and libharu exposes HPDF_CallbackWriter_New() to create a stream whose
+ * write_fn is an ordinary function pointer. Point pdf->stream at one of
+ * those before saving and every object libharu serializes is handed
+ * straight to the caller - the serialized document is never held in
+ * memory, which is the property the streamed API exists to provide.
+ *
+ * What this does NOT give is bytes before the end: libharu builds its
+ * object graph in memory and can only emit it once, at finish. PoDoFo's
+ * PdfStreamedDocument additionally pushes each page as it is completed and
+ * releases it. Both engines therefore accept an unbounded number of pages
+ * and neither buffers the serialized output; only PoDoFo also keeps the
+ * object graph small. Callers that need per-page flushing should select
+ * PoDoFo - but no caller has to branch to *use* the API. */
+static HPDF_STATUS h_streamed_write(HPDF_Stream stream, const HPDF_BYTE *ptr,
+                                    HPDF_UINT size)
+{
+    haru_doc *d = (haru_doc *)stream->attr;
+    pdf_status rc;
+
+    if (!d || !d->sink_write)
+        return HPDF_SetError(stream->error, HPDF_INVALID_OPERATION, 0);
+    if (d->sink_status != PDF_OK)
+        return (HPDF_STATUS)d->sink_status; /* already aborted: stop writing */
+    rc = d->sink_write((const unsigned char *)ptr, (size_t)size, d->sink_user);
+    if (rc != PDF_OK)
+    {
+        d->sink_status = rc;
+        return (HPDF_STATUS)rc;
+    }
+    return HPDF_OK;
+}
+
+static pdf_status h_doc_create_streamed(pdf_stream_write_fn write_fn,
+                                        void *userdata,
+                                        pdf_backend_doc **out_doc)
+{
+    haru_doc *d;
+    pdf_status rc;
+
+    if (!write_fn || !out_doc)
+        return PDF_ERR_INVALID_PARAM;
+
+    /* Same document as the batch path: pages, fonts and content are built
+     * identically, only the serializer's destination differs. */
+    rc = h_doc_create(out_doc);
+    if (rc != PDF_OK)
+        return rc;
+    d = (haru_doc *)*out_doc;
+    d->streamed = 1;
+    d->sink_write = write_fn;
+    d->sink_user = userdata;
+    d->sink_status = PDF_OK;
+    return PDF_OK;
+}
+
+static pdf_status h_doc_finish(pdf_backend_doc *doc)
+{
+    haru_doc *d = (haru_doc *)doc;
+    HPDF_Stream sink;
+    HPDF_STATUS st;
+
+    if (!d)
+        return PDF_ERR_INVALID_HANDLE;
+    if (!d->streamed)
+        return PDF_OK; /* memory-mode documents have nothing to finish */
+    if (d->finished)
+        return d->sink_status;
+
+    sink = HPDF_CallbackWriter_New(d->pdf->mmgr, h_streamed_write, d);
+    if (!sink)
+        return PDF_ERR_OUT_OF_MEMORY;
+    /* HPDF_Free() frees pdf->stream, so this replaces nothing that leaks:
+     * the member starts out NULL and HPDF_SaveToStream() is the only other
+     * place that assigns it. */
+    d->pdf->stream = sink;
+
+    st = HPDF_SaveToStream(d->pdf);
+    d->finished = 1;
+
+    /* Check the sink first: HPDF_SaveToStream() reports the document's
+     * error, and a write function that merely returns a failure code does
+     * not set one, so its return value cannot be trusted to carry a
+     * rejected write. */
+    if (d->sink_status != PDF_OK)
+    {
+        pdf_status rc = d->sink_status;
+        snprintf(d->error, sizeof(d->error),
+                 "libharu: streamed save aborted, the sink rejected data");
+        HPDF_ResetError(d->pdf); /* leave the document usable for free() */
+        return rc;
+    }
+    if (st != HPDF_OK)
+        return haru_fail(d, "streamed save");
+    return PDF_OK;
 }
 
 static pdf_status h_doc_save_to_file(pdf_backend_doc *doc, const char *path)
@@ -1654,10 +1782,8 @@ const pdf_backend_vtable g_libharu_vt = {
     h_outline_set_open,
     h_outline_free,
     h_doc_save_to_stream,
-    NULL, /* doc_create_streamed: libharu cannot push pages to a device
-           * incrementally; the core falls back to create + save_to_stream,
-           * which buffers in memory (acceptable for bounded jobs). */
-    NULL, /* doc_finish: memory-mode documents have nothing to finish */
+    h_doc_create_streamed,
+    h_doc_finish,
 
     h_page_set_size,
     h_path_clip,
