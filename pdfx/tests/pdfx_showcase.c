@@ -1083,8 +1083,12 @@ static void page_annots(PDFX_Doc doc, PDFX_Page page, PDFX_Page target,
         {
             OK(PDFX_Annot_SetRGBColor(sq, rgb(0.85, 0.30, 0.10)),
                "annot: square colour");
-            OK(PDFX_Annotation_SetBorderStyle(sq, PDFX_BS_SOLID, 1.5, 0, 0, 0),
-               "annot: square border");
+            /* pdflib does not model /BS, so this must decline rather than
+             * return PDFX_OK and write nothing - a caller cannot tell the
+             * difference without opening the file. */
+            check(PDFX_Annotation_SetBorderStyle(sq, PDFX_BS_SOLID, 1.5, 0, 0, 0)
+                      == PDFX_UNSUPPORTED_FUNC,
+                  "annot: square border is declined, not silently dropped");
         }
     }
     {
@@ -1095,8 +1099,9 @@ static void page_annots(PDFX_Doc doc, PDFX_Page page, PDFX_Page target,
         {
             OK(PDFX_Annot_SetRGBColor(ci, rgb(0.10, 0.40, 0.70)),
                "annot: circle colour");
-            OK(PDFX_Annotation_SetBorderStyle(ci, PDFX_BS_SOLID, 1.5, 0, 0, 0),
-               "annot: circle border");
+            check(PDFX_Annotation_SetBorderStyle(ci, PDFX_BS_SOLID, 1.5, 0, 0, 0)
+                      == PDFX_UNSUPPORTED_FUNC,
+                  "annot: circle border is declined, not silently dropped");
         }
     }
 
@@ -1116,8 +1121,9 @@ static void page_annots(PDFX_Doc doc, PDFX_Page page, PDFX_Page target,
             "https://github.com/tdyx87/pdflib");
         check(link != NULL, "annot: URI link created");
         if (link)
-            OK(PDFX_LinkAnnot_SetBorderStyle(link, 0.5, 0, 0),
-               "annot: link border");
+            check(PDFX_LinkAnnot_SetBorderStyle(link, 0.5, 0, 0)
+                      == PDFX_UNSUPPORTED_FUNC,
+                  "annot: link border is declined, not silently dropped");
     }
     {
         /* libharu's CreateLinkAnnot takes the destination as its third

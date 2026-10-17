@@ -659,13 +659,48 @@ rename:
   system-font lookup and encryption are compiled out of this PoDoFo build,
   so those calls return an error from that backend while libharu accepts
   them. See [Known engine limits](#known-engine-limits).
-* **Some entries are stubs.** The facade reports
-  `PDFX_UNSUPPORTED_FUNC` for the entries the core does not implement
-  (`PDFX_Page_CreateFreeTextAnnot` is one). Unlike libharu, the facade does
-  **not** call the user's error handler for these: libharu's own demos
-  install a handler that `longjmp`s out of it, so invoking it for a
-  non-fatal "not implemented" would abandon a document that is perfectly
-  good. The error number is recorded and returned instead.
+* **Not every entry can do work, and the ones that can't say so.** Of the 284
+  exports, 181 forward to the core and do the work, 75 return
+  `PDFX_UNSUPPORTED_FUNC`, and 8 accept the call and ignore it because what
+  they set is a viewer hint or annotation metadata that does not change what
+  the page draws (`PDFX_Page_SetFlat`, `PDFX_MarkupAnnot_SetIntent`, …). The
+  remaining 20 return a fixed value; most are aliases (`PDFX_LoadPngImageFromFile2`
+  forwards to the same loader) or hard limits (`PDFX_GetDocMMgr` has no memory
+  pool to expose). Nothing that *would* change the output is silently dropped —
+  that distinction is enforced, see below.
+
+  Unlike libharu, the facade does **not** call the user's error handler for
+  `PDFX_UNSUPPORTED_FUNC`: libharu's own demos install a handler that
+  `longjmp`s out of it, so invoking it for a non-fatal "not implemented" would
+  abandon a document that is perfectly good. The error number is recorded and
+  returned instead.
+
+  `tools/pdfx_stub_audit.py` prints the whole classification and, more
+  usefully, intersects it with the calls your own sources make:
+
+  ```
+  python tools/pdfx_stub_audit.py --used-by app.c
+  ```
+
+  It exits non-zero if a call in `app.c` lands on a stub that returns
+  `PDFX_OK` and does nothing, so a migration can be gated in CI. Run it before
+  porting: it answers "which of my calls will quietly stop working" without
+  reading the PDF output.
+
+  Two entries are worth knowing by name because they are deliberate
+  compromises rather than gaps:
+
+  * `PDFX_TextMarkupAnnot_SetQuadPoints` returns `PDFX_OK` and ignores its
+    arguments. pdflib generates `/QuadPoints` itself from the annotation's
+    `/Rect` at creation, and libharu programs are *required* to call this, so
+    declining would break every correct caller. The result matches what was
+    asked for unless the quad is not axis-aligned with the rect.
+  * `PDFX_UseUTFEncodings` returns `PDFX_OK` because UTF-8 is already the
+    encoding every text entry point takes. The CJK font packs
+    (`PDFX_UseJPFonts` and friends) and the legacy encodings return
+    `PDFX_UNSUPPORTED_FUNC` instead: pdflib has no font registry, and a
+    `PDFX_OK` there used to make the following `GetFont` return `NULL` while
+    every call reported success.
 
 ### Verifying it
 

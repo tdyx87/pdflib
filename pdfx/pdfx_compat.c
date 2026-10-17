@@ -661,6 +661,14 @@ PDFX_STATUS PDFX_CheckError(PDFX_Error error)
     return d ? d->error_no : PDFX_OK;
 }
 
+/* Accepted and ignored, on purpose: these six set viewer hints or document
+ * metadata that pdflib does not model - the /Pages tree chunking, the
+ * initial zoom, curve flatness, an annotation's creation date and intent,
+ * and the /H highlight mode of a link. None of them changes what the page
+ * draws or where anything sits, so returning PDFX_OK does not mislead a
+ * caller into thinking content was lost; it only means "your preference was
+ * received and will not appear in the file". Everything that *would* change
+ * the output reports PDFX_UNSUPPORTED_FUNC instead. */
 PDFX_STATUS PDFX_SetPagesConfiguration(PDFX_Doc pdf, PDFX_UINT page_per_pages)
 {
     PDFX_UNUSED(pdf);
@@ -1006,6 +1014,7 @@ PDFX_STATUS PDFX_Page_SetRotate(PDFX_Page page, PDFX_UINT16 angle)
     return rc == PDF_OK ? PDFX_OK : pdfx_fail_pdf(p->doc, rc);
 }
 
+/* Viewer hint, see PDFX_SetPagesConfiguration. */
 PDFX_STATUS PDFX_Page_SetZoom(PDFX_Page page, PDFX_REAL zoom)
 {
     PDFX_UNUSED(page);
@@ -1507,10 +1516,37 @@ const char *PDFX_LoadType1FontFromFile(PDFX_Doc pdf, const char *afm_file_name,
     return NULL;
 }
 
-PDFX_STATUS PDFX_UseJPFonts(PDFX_Doc pdf)   { PDFX_UNUSED(pdf); return PDFX_OK; }
-PDFX_STATUS PDFX_UseKRFonts(PDFX_Doc pdf)   { PDFX_UNUSED(pdf); return PDFX_OK; }
-PDFX_STATUS PDFX_UseCNSFonts(PDFX_Doc pdf)  { PDFX_UNUSED(pdf); return PDFX_OK; }
-PDFX_STATUS PDFX_UseCNTFonts(PDFX_Doc pdf)  { PDFX_UNUSED(pdf); return PDFX_OK; }
+/* CJK font packs. libharu's HPDF_UseJPFonts() registers a set of Japanese
+ * font names so that a later HPDF_GetFont(pdf, "MS-Gothic") resolves. pdflib
+ * has no font registry: a CJK face has to be loaded from a file, and system
+ * font lookup is compiled out of this PoDoFo build. Returning PDFX_OK here
+ * (as this layer used to) made the following GetFont return NULL while every
+ * call still reported success - the exact silent failure the facade exists to
+ * avoid. Declining is the honest answer, and the caller can fall back to
+ * PDFX_LoadTTFontFromFile. */
+PDFX_STATUS PDFX_UseJPFonts(PDFX_Doc pdf)
+{
+    pdfx_fail((pdfx_doc_rec *)pdf, PDFX_UNSUPPORTED_FUNC);
+    return PDFX_UNSUPPORTED_FUNC;
+}
+
+PDFX_STATUS PDFX_UseKRFonts(PDFX_Doc pdf)
+{
+    pdfx_fail((pdfx_doc_rec *)pdf, PDFX_UNSUPPORTED_FUNC);
+    return PDFX_UNSUPPORTED_FUNC;
+}
+
+PDFX_STATUS PDFX_UseCNSFonts(PDFX_Doc pdf)
+{
+    pdfx_fail((pdfx_doc_rec *)pdf, PDFX_UNSUPPORTED_FUNC);
+    return PDFX_UNSUPPORTED_FUNC;
+}
+
+PDFX_STATUS PDFX_UseCNTFonts(PDFX_Doc pdf)
+{
+    pdfx_fail((pdfx_doc_rec *)pdf, PDFX_UNSUPPORTED_FUNC);
+    return PDFX_UNSUPPORTED_FUNC;
+}
 
 /* ------------------------------------------------------------------ */
 /* Text                                                                */
@@ -2021,6 +2057,7 @@ PDFX_STATUS PDFX_Page_SetDash(PDFX_Page page, const PDFX_REAL *dash_ptn,
     return PDFX_OK;
 }
 
+/* Render hint, see PDFX_SetPagesConfiguration. */
 PDFX_STATUS PDFX_Page_SetFlat(PDFX_Page page, PDFX_REAL flatness)
 {
     PDFX_UNUSED(page);
@@ -3028,6 +3065,7 @@ PDFX_STATUS PDFX_MarkupAnnot_SetTransparency(PDFX_Annotation annot,
     return rc == PDF_OK ? PDFX_OK : pdfx_map_pdf_status(rc);
 }
 
+/* Annotation metadata, see PDFX_SetPagesConfiguration. */
 PDFX_STATUS PDFX_MarkupAnnot_SetCreationDate(PDFX_Annotation annot,
                                              PDFX_Date value)
 {
@@ -3036,6 +3074,7 @@ PDFX_STATUS PDFX_MarkupAnnot_SetCreationDate(PDFX_Annotation annot,
     return PDFX_OK;
 }
 
+/* Annotation metadata, see PDFX_SetPagesConfiguration. */
 PDFX_STATUS PDFX_MarkupAnnot_SetIntent(PDFX_Annotation annot,
                                         PDFX_AnnotIntent intent)
 {
@@ -3097,6 +3136,14 @@ PDFX_STATUS PDFX_MarkupAnnot_SetInteriorTransparent(PDFX_Annotation annot)
     return PDFX_UNSUPPORTED_FUNC;
 }
 
+/* pdflib generates /QuadPoints itself, from the annotation's /Rect, when the
+ * markup annotation is created (pdf_backend_libharu.c does this in
+ * annot_create). It has no setter for an independent quad, so there is
+ * nothing to forward here. This stays PDFX_OK rather than
+ * PDFX_UNSUPPORTED_FUNC on purpose: libharu programs are *required* to call
+ * it, and the four points they pass are the corners of that same rect, so
+ * the resulting file is the one they asked for. It would be wrong only for a
+ * quad that is not axis-aligned with the rect. */
 PDFX_STATUS PDFX_TextMarkupAnnot_SetQuadPoints(PDFX_Annotation annot,
                                                PDFX_Point lb, PDFX_Point rb,
                                                PDFX_Point rt, PDFX_Point lt)
@@ -3106,6 +3153,7 @@ PDFX_STATUS PDFX_TextMarkupAnnot_SetQuadPoints(PDFX_Annotation annot,
     return PDFX_OK;
 }
 
+/* Viewer hint, see PDFX_SetPagesConfiguration. */
 PDFX_STATUS PDFX_LinkAnnot_SetHighlightMode(PDFX_Annotation annot,
                                             PDFX_AnnotHighlightMode mode)
 {
@@ -3122,6 +3170,11 @@ PDFX_STATUS PDFX_LinkAnnot_SetJavaScript(PDFX_Annotation annot,
     return PDFX_UNSUPPORTED_FUNC;
 }
 
+/* Border style. pdflib has no border-style setter - the annotation's /BS
+ * dictionary is not modelled at all, so there is nothing to forward to. It
+ * used to return PDFX_OK and write nothing, which a caller can only notice
+ * by opening the file: verified by building a square annotation, calling
+ * this with width 2.5, and finding zero /BS keys in the output. */
 PDFX_STATUS PDFX_LinkAnnot_SetBorderStyle(PDFX_Annotation annot,
                                           PDFX_REAL width, PDFX_UINT16 dash_on,
                                           PDFX_UINT16 dash_off)
@@ -3130,7 +3183,7 @@ PDFX_STATUS PDFX_LinkAnnot_SetBorderStyle(PDFX_Annotation annot,
     PDFX_UNUSED(width);
     PDFX_UNUSED(dash_on);
     PDFX_UNUSED(dash_off);
-    return PDFX_OK;
+    return PDFX_UNSUPPORTED_FUNC;
 }
 
 PDFX_STATUS PDFX_Annotation_SetBorderStyle(PDFX_Annotation annot,
@@ -3145,14 +3198,18 @@ PDFX_STATUS PDFX_Annotation_SetBorderStyle(PDFX_Annotation annot,
     PDFX_UNUSED(dash_on);
     PDFX_UNUSED(dash_off);
     PDFX_UNUSED(dash_phase);
-    return PDFX_OK;
+    return PDFX_UNSUPPORTED_FUNC;
 }
 
+/* pdflib does model this one (pdf_annot_set_open writes /Open on the popup),
+ * so forward it instead of accepting the call and dropping it. */
 PDFX_STATUS PDFX_PopupAnnot_SetOpened(PDFX_Annotation annot, PDFX_BOOL opened)
 {
-    PDFX_UNUSED(annot);
-    PDFX_UNUSED(opened);
-    return PDFX_OK;
+    pdf_status rc;
+    if (!annot)
+        return PDFX_INVALID_ANNOTATION;
+    rc = pdf_annot_set_open((pdf_annot)annot, opened ? 1 : 0);
+    return rc == PDF_OK ? PDFX_OK : pdfx_map_pdf_status(rc);
 }
 
 PDFX_STATUS PDFX_FreeTextAnnot_SetLineEndingStyle(
@@ -3370,11 +3427,21 @@ PDFX_Encoder PDFX_GetCurrentEncoder(PDFX_Doc pdf)
     return PDFX_GetEncoder(pdf, "WinAnsiEncoding");
 }
 
+/* Encoder selection. pdflib's text entry points take UTF-8 and let the
+ * engine map it through the font's encoding; there is no document-level
+ * "current encoder" to switch, and no conversion from a legacy byte string
+ * is performed. Returning PDFX_OK for a legacy encoder (as this layer used
+ * to) told the caller its Shift-JIS buffer would be converted when in fact
+ * the bytes are written through unchanged. UTF-8 is the one encoder that is
+ * genuinely already in effect, so it stays a success. */
 PDFX_STATUS PDFX_SetCurrentEncoder(PDFX_Doc pdf, const char *encoding_name)
 {
-    PDFX_UNUSED(pdf);
-    PDFX_UNUSED(encoding_name);
-    return PDFX_OK;
+    if (encoding_name &&
+        (pdfx_ci_equal(encoding_name, "UTF-8") ||
+         pdfx_ci_equal(encoding_name, "UTF8")))
+        return PDFX_OK;
+    pdfx_fail((pdfx_doc_rec *)pdf, PDFX_UNSUPPORTED_FUNC);
+    return PDFX_UNSUPPORTED_FUNC;
 }
 
 PDFX_EncoderType PDFX_Encoder_GetType(PDFX_Encoder encoder)
@@ -3405,10 +3472,35 @@ PDFX_WritingMode PDFX_Encoder_GetWritingMode(PDFX_Encoder encoder)
     return PDFX_WMODE_HORIZONTAL;
 }
 
-PDFX_STATUS PDFX_UseJPEncodings(PDFX_Doc pdf)  { PDFX_UNUSED(pdf); return PDFX_OK; }
-PDFX_STATUS PDFX_UseKREncodings(PDFX_Doc pdf)  { PDFX_UNUSED(pdf); return PDFX_OK; }
-PDFX_STATUS PDFX_UseCNSEncodings(PDFX_Doc pdf) { PDFX_UNUSED(pdf); return PDFX_OK; }
-PDFX_STATUS PDFX_UseCNTEncodings(PDFX_Doc pdf) { PDFX_UNUSED(pdf); return PDFX_OK; }
+/* Same reasoning as the CJK font packs above: these register legacy
+ * encodings that pdflib does not convert from. UTF-8 is the encoding the
+ * facade actually expects, so UseUTFEncodings() is already satisfied. */
+PDFX_STATUS PDFX_UseJPEncodings(PDFX_Doc pdf)
+{
+    pdfx_fail((pdfx_doc_rec *)pdf, PDFX_UNSUPPORTED_FUNC);
+    return PDFX_UNSUPPORTED_FUNC;
+}
+
+PDFX_STATUS PDFX_UseKREncodings(PDFX_Doc pdf)
+{
+    pdfx_fail((pdfx_doc_rec *)pdf, PDFX_UNSUPPORTED_FUNC);
+    return PDFX_UNSUPPORTED_FUNC;
+}
+
+PDFX_STATUS PDFX_UseCNSEncodings(PDFX_Doc pdf)
+{
+    pdfx_fail((pdfx_doc_rec *)pdf, PDFX_UNSUPPORTED_FUNC);
+    return PDFX_UNSUPPORTED_FUNC;
+}
+
+PDFX_STATUS PDFX_UseCNTEncodings(PDFX_Doc pdf)
+{
+    pdfx_fail((pdfx_doc_rec *)pdf, PDFX_UNSUPPORTED_FUNC);
+    return PDFX_UNSUPPORTED_FUNC;
+}
+
+/* UTF-8 is what every PDFX_* text entry point already takes, so this one
+ * really is a no-op that has succeeded. */
 PDFX_STATUS PDFX_UseUTFEncodings(PDFX_Doc pdf) { PDFX_UNUSED(pdf); return PDFX_OK; }
 
 /* ------------------------------------------------------------------ */
